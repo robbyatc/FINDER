@@ -14,8 +14,11 @@ Buka FINDER dari komputer, tablet, atau ponsel melalui:
 - Mendukung CSV, TSV, XLS, XLSX, serta laporan tabel HTML yang berekstensi `.xls`.
 - Pemetaan otomatis untuk Flight Number/Callsign, ADEP, ADES, EOBD, ATD, ATA, gate, runway, register, dan movement type.
 - Normalisasi tanggal, jam, kapitalisasi, spasi, tanda hubung, serta tanda petik bawaan DAT.
-- Deduplikasi DAT sebelum pencocokan.
-- Hasil: Missing in Stream, Matched, Extra in Stream, dan Duplicate DAT.
+- Deduplikasi DAT berbasis movement time, completeness, timestamp, dan message number.
+- Validasi STREAM berdasarkan status flight dan selisih waktu 15/30/60 menit.
+- Hasil: Missing in Stream, Matched, Need Review, Extra in Stream, dan Duplicate DAT.
+- Pemisahan Missing Billing Review dari Non-Billable/Internal Review.
+- Audit reason untuk setiap hasil dan candidate STREAM.
 - Filter Missing in Stream berdasarkan tanggal, flight number, aerodrome, TO FROM, dan movement.
 - Dashboard metrik dan accuracy percentage.
 - Laporan Excel dengan sheet Summary, Missing in Stream, Matched, Extra in Stream, dan Duplicate DAT.
@@ -57,6 +60,8 @@ Record dicocokkan menggunakan kombinasi:
 - ADES / TO FROM
 - Movement Type (D/A/L/O)
 
-Duplicate DAT dikeluarkan sebelum pencocokan. Accuracy dihitung sebagai jumlah Matched dibagi total DAT unik.
+Untuk setiap base key, FINDER memilih satu DAT terbaik: movement time terisi, completeness score tertinggi, timestamp terbaru, lalu message number terbesar. Hanya record yang tidak terpilih masuk Duplicate DAT; record terbaik selalu dipakai dalam reconciliation.
+
+Candidate STREAM harus memiliki status valid, tanggal movement yang sesuai, dan selisih waktu dalam tolerance. Selisih di atas tolerance sampai 120 menit masuk Need Review; selisih lebih dari 120 menit, tanggal berbeda, waktu invalid, atau status invalid masuk Missing in Stream. Accuracy dihitung sebagai jumlah Matched dibagi total DAT Unique.
 
 Pada versi lokal, file diproses di komputer operator. Pada versi cloud, file diproses oleh sesi aplikasi Streamlit dan tidak dikomit ke repository GitHub oleh FINDER.

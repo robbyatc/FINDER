@@ -9,7 +9,9 @@ import streamlit as st
 
 from comparison import OUTPUT_LABELS
 from reconciliation import (
+    AUDIT_COLUMNS,
     DETAIL_COLUMNS,
+    DUPLICATE_AUDIT_COLUMNS,
     RESULT_COLUMNS,
     build_excel_report,
     detected_mapping,
@@ -194,6 +196,33 @@ def section_heading(eyebrow: str, title: str, copy: str) -> None:
     )
 
 
+def reconciliation_settings() -> dict[str, object]:
+    tolerance_label = st.session_state.get(
+        "finder_time_tolerance", "30 minutes - Recommended"
+    )
+    tolerance_map = {
+        "15 minutes": 15,
+        "30 minutes - Recommended": 30,
+        "60 minutes": 60,
+    }
+    invalid_status_text = st.session_state.get("finder_invalid_statuses", "OTHER")
+    invalid_statuses = [
+        item.strip().upper()
+        for item in str(invalid_status_text).replace("\n", ",").split(",")
+        if item.strip()
+    ]
+    return {
+        "time_tolerance_minutes": tolerance_map.get(str(tolerance_label), 30),
+        "invalid_stream_statuses": invalid_statuses or ["OTHER"],
+        "treat_invalid_stream_status_as_missing": bool(
+            st.session_state.get("finder_treat_invalid_status", True)
+        ),
+        "show_audit_columns": bool(
+            st.session_state.get("finder_show_audit_columns", False)
+        ),
+    }
+
+
 def render_sidebar() -> str:
     with st.sidebar:
         st.markdown(
@@ -218,6 +247,34 @@ def render_sidebar() -> str:
             ],
             label_visibility="collapsed",
             key="finder_navigation",
+        )
+        st.divider()
+        st.markdown("#### ⚙️ Reconciliation settings")
+        st.selectbox(
+            "Time tolerance",
+            [
+                "15 minutes",
+                "30 minutes - Recommended",
+                "60 minutes",
+            ],
+            index=1,
+            key="finder_time_tolerance",
+        )
+        st.text_input(
+            "Invalid STREAM status",
+            value="OTHER",
+            help="Pisahkan beberapa status dengan koma, misalnya OTHER, CANCELLED.",
+            key="finder_invalid_statuses",
+        )
+        st.checkbox(
+            "Treat invalid STREAM status as Missing in Stream",
+            value=True,
+            key="finder_treat_invalid_status",
+        )
+        st.checkbox(
+            "Show audit columns",
+            value=False,
+            key="finder_show_audit_columns",
         )
         st.divider()
         has_result = bool(st.session_state.get("finder_results"))
@@ -355,6 +412,7 @@ def render_validation(
                 "flight", "eobd", "adep", "ades", "movement", "register",
                 "eobt", "atd", "ata", "departure_gate", "arrival_gate",
                 "departure_runway", "arrival_runway", "parking", "runway",
+                "status_flight", "timestamp", "message_num",
             ]
             mapping_rows = []
             for field in fields:
@@ -391,7 +449,7 @@ def render_summary_dashboard(results: dict[str, object]) -> None:
         "Summary dashboard",
         "Ringkasan cakupan data, hasil pencocokan, dan potensi data billing yang belum tercatat.",
     )
-    row_one = st.columns(5)
+    row_one = st.columns(6)
     with row_one[0]:
         metric_card("Total DAT DEP", f"{summary['total_dat_dep']:,}", "#1769e0", "Departure records")
     with row_one[1]:
@@ -399,23 +457,31 @@ def render_summary_dashboard(results: dict[str, object]) -> None:
     with row_one[2]:
         metric_card("Total DAT Combined", f"{summary['total_dat_combined']:,}", "#2f80ed", "Before deduplication")
     with row_one[3]:
-        metric_card("Total STREAM", f"{summary['total_stream']:,}", "#2f80ed", "Comparison records")
+        metric_card("Total DAT Unique", f"{summary['total_dat_unique']:,}", "#13a8bd", "Best records selected")
     with row_one[4]:
+        metric_card("Total STREAM", f"{summary['total_stream']:,}", "#2f80ed", "Comparison records")
+    with row_one[5]:
         metric_card("Matched", f"{summary['matched']:,}", "#1f9d68", "Validated in STREAM")
 
     st.write("")
-    row_two = st.columns(4)
+    row_two = st.columns(5)
     with row_two[0]:
         metric_card("Missing in Stream", f"{summary['missing_in_stream']:,}", "#e84c3d", "Potential unbilled flights", True)
     with row_two[1]:
-        metric_card("Extra in Stream", f"{summary['extra_in_stream']:,}", "#7567c7", "Not found in DAT")
+        metric_card("Need Review", f"{summary['need_review']:,}", "#f28b30", "Time difference ≤ 120 min")
     with row_two[2]:
-        metric_card("Duplicate DAT", f"{summary['duplicate_dat']:,}", "#d99a1b", "Duplicate copies removed")
+        metric_card("Extra in Stream", f"{summary['extra_in_stream']:,}", "#7567c7", "Not found in DAT")
     with row_two[3]:
+        metric_card("Duplicate DAT", f"{summary['duplicate_dat']:,}", "#d99a1b", "Non-selected copies")
+    with row_two[4]:
         metric_card("Accuracy Percentage", f"{summary['accuracy_percentage']:.1f}%", "#13a8bd", "Matched ÷ unique DAT")
 
 
-def filtered_missing_table(frame: pd.DataFrame) -> pd.DataFrame:
+def filtered_missing_table(
+    frame: pd.DataFrame,
+    key_prefix: str = "missing",
+    show_internal_exclusion: bool = True,
+) -> pd.DataFrame:
     if frame.empty:
         st.info("Tidak ada data MISSING IN STREAM. Semua data DAT sudah ditemukan di STREAM.")
         return frame
@@ -425,6 +491,19 @@ def filtered_missing_table(frame: pd.DataFrame) -> pd.DataFrame:
     min_date = min(valid_dates) if len(valid_dates) else date.today()
     max_date = max(valid_dates) if len(valid_dates) else date.today()
 
+    if show_internal_exclusion:
+        exclude_internal = st.checkbox(
+            "Exclude Non-Billable / Internal Movement",
+            value=True,
+            key=f"{key_prefix}_exclude_internal",
+            help=(
+                "Menyaring flight number yang mengandung LANDASAN, RWYINS, RWYINSP, "
+                "INSPCTN, CAR, VFR, IFR, TEST, TEST1, TEST2, atau MPS."
+            ),
+        )
+    else:
+        exclude_internal = False
+
     filter_row = st.columns([1.25, 1.2, 1, 1, .9])
     with filter_row[0]:
         selected_dates = st.date_input(
@@ -432,23 +511,25 @@ def filtered_missing_table(frame: pd.DataFrame) -> pd.DataFrame:
             value=(min_date, max_date),
             min_value=min_date,
             max_value=max_date,
-            key="missing_date_filter",
+            key=f"{key_prefix}_date_filter",
         )
     with filter_row[1]:
         flight_search = st.text_input(
-            "Flight number search", placeholder="e.g. LNI200", key="missing_flight_search"
+            "Flight number search", placeholder="e.g. LNI200", key=f"{key_prefix}_flight_search"
         )
     with filter_row[2]:
         aerodromes = sorted(value for value in frame["AERODROME"].dropna().astype(str).unique() if value)
-        selected_aerodromes = st.multiselect("Aerodrome", aerodromes, key="missing_aerodrome")
+        selected_aerodromes = st.multiselect("Aerodrome", aerodromes, key=f"{key_prefix}_aerodrome")
     with filter_row[3]:
         destinations = sorted(value for value in frame["TO FROM"].dropna().astype(str).unique() if value)
-        selected_destinations = st.multiselect("TO FROM", destinations, key="missing_to_from")
+        selected_destinations = st.multiselect("TO FROM", destinations, key=f"{key_prefix}_to_from")
     with filter_row[4]:
         movements = sorted(value for value in frame["D/A/L/O"].dropna().astype(str).unique() if value)
-        selected_movements = st.multiselect("Movement A/D", movements, default=movements, key="missing_movement")
+        selected_movements = st.multiselect("Movement A/D", movements, default=movements, key=f"{key_prefix}_movement")
 
     filtered = frame.copy()
+    if exclude_internal and "BILLING CATEGORY" in filtered.columns:
+        filtered = filtered.loc[filtered["BILLING CATEGORY"] == "BILLING REVIEW"]
     if isinstance(selected_dates, (tuple, list)) and len(selected_dates) == 2:
         filtered = filtered.loc[
             parsed_dates.between(selected_dates[0], selected_dates[1], inclusive="both")
@@ -468,8 +549,25 @@ def filtered_missing_table(frame: pd.DataFrame) -> pd.DataFrame:
     return filtered
 
 
-def result_table(frame: pd.DataFrame, height: int = 480) -> None:
-    columns = [column for column in DETAIL_COLUMNS if column in frame.columns]
+def result_table(
+    frame: pd.DataFrame,
+    height: int = 480,
+    extra_default_columns: list[str] | None = None,
+) -> None:
+    settings = reconciliation_settings()
+    columns = [column for column in RESULT_COLUMNS if column in frame.columns]
+    if extra_default_columns:
+        columns.extend(
+            column
+            for column in extra_default_columns
+            if column in frame.columns and column not in columns
+        )
+    if settings["show_audit_columns"]:
+        columns.extend(
+            column
+            for column in AUDIT_COLUMNS
+            if column in frame.columns and column not in columns
+        )
     st.dataframe(
         frame[columns],
         width="stretch",
@@ -480,6 +578,26 @@ def result_table(frame: pd.DataFrame, height: int = 480) -> None:
             "STATUS": st.column_config.TextColumn("STATUS", width="medium"),
         },
     )
+
+
+def render_missing_reason_summary(frame: pd.DataFrame) -> None:
+    if frame.empty or "MATCH_REASON" not in frame.columns:
+        return
+    monitored_reasons = [
+        "STREAM NOT FOUND",
+        "STREAM STATUS OTHER",
+        "STREAM INVALID ATA DATE",
+        "STREAM INVALID ATD DATE",
+        "STREAM TIME MISMATCH",
+    ]
+    reason_text = frame["MATCH_REASON"].fillna("").astype(str)
+    summaries = []
+    for reason in monitored_reasons:
+        count = int(reason_text.str.contains(reason, regex=False).sum())
+        if count:
+            summaries.append(f"{reason}: {count:,}")
+    if summaries:
+        st.warning("Audit reason summary — " + " · ".join(summaries))
 
 
 def render_export_download(results: dict[str, object], report_bytes: bytes | None) -> None:
@@ -508,8 +626,10 @@ def render_results_page(results: dict[str, object]) -> None:
     summary = results["summary"]
     tabs = st.tabs(
         [
-            f"🚨 Missing in Stream ({summary['missing_in_stream']:,})",
+            f"🚨 Missing — Billing Review ({summary['missing_billing_review']:,})",
+            f"🛠 Missing — Internal Review ({summary['missing_non_billable_review']:,})",
             f"✅ Matched ({summary['matched']:,})",
+            f"🟠 Need Review ({summary['need_review']:,})",
             f"◈ Extra in Stream ({summary['extra_in_stream']:,})",
             f"⚠ Duplicate DAT ({summary['duplicate_dat']:,})",
             "▦ Summary",
@@ -519,25 +639,48 @@ def render_results_page(results: dict[str, object]) -> None:
         st.markdown(
             """
             <div class="result-banner">
-              <div class="result-banner-title">MISSING IN STREAM — Potential Unbilled Flights</div>
-              <div class="result-banner-copy">Data ada di DAT DEP/ARR tetapi belum ditemukan di STREAM.</div>
+              <div class="result-banner-title">MISSING IN STREAM — Billing Review / Potential Unbilled Flights</div>
+              <div class="result-banner-copy">Prioritas billing: STREAM tidak ditemukan, status tidak valid, tanggal salah, atau time mismatch.</div>
             </div>
             """,
             unsafe_allow_html=True,
         )
-        filtered = filtered_missing_table(results["missing"])
-        st.caption(f"Showing {len(filtered):,} of {len(results['missing']):,} missing records")
+        render_missing_reason_summary(results["missing"])
+        filtered = filtered_missing_table(
+            results["missing"], key_prefix="missing_billing", show_internal_exclusion=True
+        )
+        st.caption(
+            f"Showing {len(filtered):,} of {len(results['missing']):,} total missing records"
+        )
         result_table(filtered)
     with tabs[1]:
+        st.info(
+            "MISSING IN STREAM — Non-Billable/Internal Review berdasarkan rule flight number. "
+            "Data tetap disimpan untuk audit tetapi dipisahkan dari prioritas billing."
+        )
+        internal_filtered = filtered_missing_table(
+            results["missing_non_billable"],
+            key_prefix="missing_internal",
+            show_internal_exclusion=False,
+        )
+        result_table(internal_filtered)
+    with tabs[2]:
         st.success("MATCHED — Data DAT berhasil ditemukan di STREAM.")
         result_table(results["matched"])
-    with tabs[2]:
+    with tabs[3]:
+        st.warning(
+            "NEED REVIEW — STREAM valid, tetapi selisih waktu melebihi tolerance dan tidak lebih dari 120 menit."
+        )
+        result_table(results["need_review"])
+    with tabs[4]:
         st.info("EXTRA IN STREAM — Data STREAM tidak memiliki pasangan di DAT DEP/ARR.")
         result_table(results["extra"])
-    with tabs[3]:
-        st.warning("DUPLICATE DAT — Salinan tambahan dikeluarkan sebelum rekonsiliasi.")
-        result_table(results["duplicates"])
-    with tabs[4]:
+    with tabs[5]:
+        st.warning(
+            "DUPLICATE DAT — Hanya record yang tidak terpilih. Record terbaik tetap menjadi DAT Unique dan dipakai untuk reconciliation."
+        )
+        result_table(results["duplicates"], extra_default_columns=DUPLICATE_AUDIT_COLUMNS)
+    with tabs[6]:
         st.dataframe(results["summary_table"], width="stretch", hide_index=True)
         if summary["incomplete_dat_keys"] or summary["incomplete_stream_keys"]:
             st.warning(
@@ -549,7 +692,7 @@ def render_results_page(results: dict[str, object]) -> None:
     section_heading(
         "EXPORT",
         "Export reconciliation report",
-        "Workbook berisi Summary, Missing in Stream, Matched, Extra in Stream, dan Duplicate DAT.",
+        "Workbook berisi Summary, Missing in Stream, Matched, Need Review, Extra in Stream, Duplicate DAT, dan Audit Detail.",
     )
     download_left, download_right = st.columns([1.2, 2])
     with download_left:
@@ -579,11 +722,17 @@ def render_upload_page() -> None:
         "FINDER memastikan semua file dan kolom kunci tersedia sebelum proses dijalankan.",
     )
     ready, dep_mapping, arr_mapping, stream_mapping, _ = render_validation(dep, arr, stream)
+    settings = reconciliation_settings()
 
     input_signature = None
     if ready:
         input_signature = "-".join(
-            file_digest(package["data"]) for package in (dep, arr, stream)
+            [file_digest(package["data"]) for package in (dep, arr, stream)]
+            + [
+                str(settings["time_tolerance_minutes"]),
+                ",".join(settings["invalid_stream_statuses"]),
+                str(settings["treat_invalid_stream_status_as_missing"]),
+            ]
         )
         if st.session_state.get("finder_result_signature") not in {None, input_signature}:
             st.info("Input berubah. Jalankan rekonsiliasi kembali untuk memperbarui hasil.")
@@ -615,6 +764,11 @@ def render_upload_page() -> None:
                 dep_mapping,
                 arr_mapping,
                 stream_mapping,
+                time_tolerance_minutes=int(settings["time_tolerance_minutes"]),
+                invalid_stream_statuses=settings["invalid_stream_statuses"],
+                treat_invalid_stream_status_as_missing=bool(
+                    settings["treat_invalid_stream_status_as_missing"]
+                ),
             )
             progress.progress(76, text="Comparing DAT vs STREAM")
             report = build_excel_report(results)
@@ -651,7 +805,7 @@ def render_export_page(results: dict[str, object] | None) -> None:
     summary = results["summary"]
     cols = st.columns(3)
     with cols[0]:
-        metric_card("Report Status", "READY", "#1f9d68", "Five worksheets generated")
+        metric_card("Report Status", "READY", "#1f9d68", "Seven worksheets generated")
     with cols[1]:
         metric_card("Missing Records", f"{summary['missing_in_stream']:,}", "#e84c3d", "Priority billing review", True)
     with cols[2]:
@@ -664,8 +818,10 @@ def render_export_page(results: dict[str, object] | None) -> None:
             - **Summary** — reconciliation metrics and accuracy
             - **Missing in Stream** — potential unbilled flights
             - **Matched** — validated DAT records
+            - **Need Review** — valid STREAM with time difference above tolerance
             - **Extra in Stream** — STREAM records without DAT pair
-            - **Duplicate DAT** — duplicate copies removed before matching
+            - **Duplicate DAT** — non-selected DAT copies only
+            - **Audit Detail** — status, reason, movement datetime, and selected candidate audit
             """
         )
         render_export_download(results, st.session_state.get("finder_report"))
@@ -699,7 +855,7 @@ def render_about_page() -> None:
         with st.container(border=True):
             st.markdown("#### 🔒 Data handling")
             st.markdown(
-                "Seluruh file diproses pada mesin yang menjalankan aplikasi. Data tidak dikirim ke layanan eksternal."
+                "Pada deployment cloud, file diproses oleh sesi aplikasi Streamlit dan tidak dikomit ke repository GitHub oleh FINDER."
             )
 
 

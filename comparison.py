@@ -149,6 +149,44 @@ FIELD_DEFINITIONS = OrderedDict(
             },
         ),
         (
+            "status_flight",
+            {
+                "label": "STREAM Status Flight",
+                "aliases": [
+                    "status flight",
+                    "flight status",
+                    "statusflight",
+                    "status",
+                ],
+            },
+        ),
+        (
+            "timestamp",
+            {
+                "label": "Timestamp",
+                "aliases": [
+                    "timestamp",
+                    "time stamp",
+                    "message timestamp",
+                    "updated at",
+                    "update time",
+                ],
+            },
+        ),
+        (
+            "message_num",
+            {
+                "label": "Message Number",
+                "aliases": [
+                    "messagenum",
+                    "message num",
+                    "message number",
+                    "msg num",
+                    "msg number",
+                ],
+            },
+        ),
+        (
             "arrival_gate",
             {
                 "label": "Arrival Gate",
