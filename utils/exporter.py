@@ -151,11 +151,20 @@ def build_excel_report(results: Mapping[str, object]) -> bytes:
             frame.itertuples(index=False, name=None), start=5
         ):
             for column_index, value in enumerate(values, start=1):
+                column_name = frame.columns[column_index - 1]
                 clean_value = "" if pd.isna(value) else value
+                if column_name in {"DATE OF FLIGHT", "ACTUAL MOVEMENT DATE"} and clean_value:
+                    try:
+                        clean_value = datetime.strptime(
+                            str(clean_value), "%Y-%m-%d"
+                        ).date()
+                    except ValueError:
+                        pass
                 cell = sheet.cell(row_index, column_index, clean_value)
                 cell.alignment = Alignment(vertical="top")
-                column_name = frame.columns[column_index - 1]
-                if column_name in text_columns:
+                if column_name in {"DATE OF FLIGHT", "ACTUAL MOVEMENT DATE"}:
+                    cell.number_format = "yyyy-mm-dd"
+                elif column_name in text_columns:
                     cell.number_format = "@"
                 elif column_name == "TIME DIFFERENCE MINUTES" and clean_value != "":
                     cell.number_format = "0.0"
@@ -180,4 +189,3 @@ def build_excel_report(results: Mapping[str, object]) -> bytes:
     buffer = io.BytesIO()
     workbook.save(buffer)
     return buffer.getvalue()
-

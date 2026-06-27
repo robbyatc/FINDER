@@ -575,6 +575,9 @@ def result_table(
         height=height,
         column_config={
             "DATE OF FLIGHT": st.column_config.DateColumn("DATE OF FLIGHT", format="YYYY-MM-DD"),
+            "ACTUAL MOVEMENT DATE": st.column_config.DateColumn(
+                "ACTUAL MOVEMENT DATE", format="YYYY-MM-DD"
+            ),
             "STATUS": st.column_config.TextColumn("STATUS", width="medium"),
         },
     )

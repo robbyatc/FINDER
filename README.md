@@ -19,6 +19,7 @@ Buka FINDER dari komputer, tablet, atau ponsel melalui:
 - Hasil: Missing in Stream, Matched, Need Review, Extra in Stream, dan Duplicate DAT.
 - Pemisahan Missing Billing Review dari Non-Billable/Internal Review.
 - Audit reason untuk setiap hasil dan candidate STREAM.
+- Kolom Actual Movement Date dari ATA untuk arrival atau ATD untuk departure, tanpa mengubah EOBD sebagai base key.
 - Filter Missing in Stream berdasarkan tanggal, flight number, aerodrome, TO FROM, dan movement.
 - Dashboard metrik dan accuracy percentage.
 - Laporan Excel dengan sheet Summary, Missing in Stream, Matched, Extra in Stream, dan Duplicate DAT.

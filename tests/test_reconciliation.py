@@ -95,6 +95,7 @@ class ReconciliationTests(unittest.TestCase):
             missing_headers,
             [
                 "DATE OF FLIGHT",
+                "ACTUAL MOVEMENT DATE",
                 "FLIGHT NUMBER",
                 "AERODROME",
                 "TO FROM",
@@ -155,6 +156,7 @@ class ReconciliationTests(unittest.TestCase):
         self.assertEqual(selected["ARRIVAL GATE"], "13")
         self.assertEqual(selected["ARRIVAL RUNWAY"], "23")
         self.assertEqual(selected["DAT MOVEMENT DATETIME"], "2026-05-30 00:48")
+        self.assertEqual(selected["ACTUAL MOVEMENT DATE"], "2026-05-30")
         self.assertEqual(len(result["duplicates"]), 1)
         duplicate = result["duplicates"].iloc[0]
         self.assertFalse(bool(duplicate["SELECTED_RECORD_FLAG"]))
@@ -302,6 +304,39 @@ class ReconciliationTests(unittest.TestCase):
         self.assertEqual(
             set(result["missing_non_billable"]["FLIGHT NUMBER"]), {"TEST1"}
         )
+
+    def test_overnight_arrival_keeps_eobd_and_actual_movement_date(self):
+        dep = pd.DataFrame(columns=["callsign", "adep", "ades", "eobd"])
+        arr = pd.DataFrame(
+            {
+                "callsign": ["CTV010"],
+                "adep": ["WIHH"],
+                "ades": ["WIMM"],
+                "eobd": ["260622"],
+                "atd": ["2026-06-22 23:46:00"],
+                "ata": ["2026-06-23 01:42:00"],
+                "register": ["PKGLM"],
+                "arrivalRunway": ["23"],
+                "arrivalGate": ["27"],
+            }
+        )
+        stream = pd.DataFrame(
+            {
+                "DATE OF FLIGHT": ["2026-06-22"],
+                "FLIGHT NUMBER": ["CTV010"],
+                "AERODROME": ["WIHH"],
+                "TO FROM": ["WIMM"],
+                "D/A/L/O": ["A"],
+                "ATA": ["2026-06-23 01:42:00"],
+                "STATUS FLIGHT": ["REGULER"],
+            }
+        )
+        result = reconcile_dat_vs_stream(dep, arr, stream)
+        matched = result["matched"].iloc[0]
+        self.assertEqual(matched["DATE OF FLIGHT"], "2026-06-22")
+        self.assertEqual(matched["ACTUAL MOVEMENT DATE"], "2026-06-23")
+        self.assertEqual(matched["ATA"], "01:42")
+        self.assertEqual(matched["MATCH_REASON"], "VALID STREAM MATCH")
 
 
 if __name__ == "__main__":

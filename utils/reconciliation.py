@@ -32,6 +32,7 @@ from utils.normalizer import (
 
 RESULT_COLUMNS = [
     "DATE OF FLIGHT",
+    "ACTUAL MOVEMENT DATE",
     "FLIGHT NUMBER",
     "AERODROME",
     "TO FROM",
@@ -214,6 +215,11 @@ def standardize_dataset(
 
         record = {
             "DATE OF FLIGHT": date_of_flight,
+            "ACTUAL MOVEMENT DATE": (
+                pd.Timestamp(move_datetime).strftime("%Y-%m-%d")
+                if move_datetime is not None
+                else ""
+            ),
             "FLIGHT NUMBER": normalize_code(raw["flight"]),
             "AERODROME": normalize_code(raw["adep"]),
             "TO FROM": normalize_code(raw["ades"]),
