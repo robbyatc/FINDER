@@ -2,6 +2,12 @@
 
 FINDER mendeteksi data penerbangan pada **DAT DEP** dan **DAT ARR** yang belum tercatat di **STREAM** untuk mendukung validasi billing.
 
+## Aplikasi online
+
+Buka FINDER dari komputer, tablet, atau ponsel melalui:
+
+**https://finder-dat-stream.streamlit.app/**
+
 ## Fitur utama
 
 - Tiga area upload: DAT DEP, DAT ARR, dan STREAM.
@@ -53,4 +59,4 @@ Record dicocokkan menggunakan kombinasi:
 
 Duplicate DAT dikeluarkan sebelum pencocokan. Accuracy dihitung sebagai jumlah Matched dibagi total DAT unik.
 
-Semua file diproses lokal pada komputer yang menjalankan aplikasi.
+Pada versi lokal, file diproses di komputer operator. Pada versi cloud, file diproses oleh sesi aplikasi Streamlit dan tidak dikomit ke repository GitHub oleh FINDER.
