@@ -228,6 +228,14 @@ def normalize_record_times(
     }
 
 
+def normalize_eobt_datetime(
+    flight_date: object, eobt_value: object
+) -> pd.Timestamp | None:
+    """Normalize EOBT to a naive datetime anchored to DATE OF FLIGHT."""
+    eobt_datetime, _ = parse_datetime_value(eobt_value, flight_date)
+    return eobt_datetime
+
+
 def fallback_time_display(value: object) -> str:
     parsed_time = _time_from_value(value)
     if parsed_time:
@@ -281,11 +289,16 @@ def parse_message_number(value: object) -> float:
         return float(match.group()) if match else float("-inf")
 
 
-def is_non_billable_flight(value: object) -> bool:
+def is_excluded_flight_number(value: object) -> bool:
+    """Return True for hard-excluded non-billable/internal movements."""
     flight = normalize_code(value)
     return any(token in flight for token in NON_BILLABLE_FLIGHT_TOKENS)
 
 
+def is_non_billable_flight(value: object) -> bool:
+    """Backward-compatible alias for the hard exclusion rule."""
+    return is_excluded_flight_number(value)
+
+
 def duplicate_group_key(values: Iterable[object]) -> str:
     return " | ".join(clean_text(value) for value in values)
-

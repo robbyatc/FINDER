@@ -18,12 +18,14 @@ from utils.normalizer import (
     clean_text,
     duplicate_group_key,
     format_datetime,
-    is_non_billable_flight,
+    format_time,
+    is_excluded_flight_number as _is_excluded_flight_number,
     is_present,
     movement_datetime,
     normalize_code,
     normalize_date,
     normalize_display_text,
+    normalize_eobt_datetime,
     normalize_record_times,
     parse_message_number,
     parse_priority_timestamp,
@@ -60,6 +62,15 @@ AUDIT_COLUMNS = [
     "STREAM MATCH KEY",
     "STREAM VALIDATION RESULT",
     "BILLING CATEGORY",
+    "DAT_RECOVERY_USED",
+    "DAT_RECOVERY_REASON",
+    "DAT_RECOVERY_SOURCE_DATE",
+    "DAT_RECOVERY_SOURCE_ROW",
+    "ORIGINAL_DAT_DATE",
+    "RECOVERED_DAT_DATE",
+    "USED_FOR_RECOVERY",
+    "FLIGHT_INSTANCE_KEY",
+    "MOVEMENT_TIME_BUCKET",
 ]
 
 DETAIL_COLUMNS = RESULT_COLUMNS + AUDIT_COLUMNS
@@ -70,6 +81,22 @@ DUPLICATE_AUDIT_COLUMNS = [
     "DUPLICATE_REASON",
     "COMPLETENESS_SCORE",
     "HAS_MOVEMENT_TIME",
+    "FLIGHT_INSTANCE_KEY",
+    "MOVEMENT_TIME_BUCKET",
+    "USED_FOR_RECOVERY",
+    "DAT_RECOVERY_REASON",
+    "DAT_RECOVERY_SOURCE_DATE",
+    "DAT_RECOVERY_SOURCE_ROW",
+]
+
+RECOVERY_AUDIT_COLUMNS = [
+    "DAT_RECOVERY_USED",
+    "DAT_RECOVERY_REASON",
+    "DAT_RECOVERY_SOURCE_DATE",
+    "DAT_RECOVERY_SOURCE_ROW",
+    "ORIGINAL_DAT_DATE",
+    "RECOVERED_DAT_DATE",
+    "USED_FOR_RECOVERY",
 ]
 
 MATCH_KEY_SPECS = [
@@ -100,6 +127,8 @@ STANDARDIZED_COLUMNS = RESULT_COLUMNS + [
     "STREAM STATUS FLIGHT",
     "TIMESTAMP",
     "MESSAGE NUM",
+    "EOBT",
+    "EOBT_DATETIME",
     "ATD_DATETIME",
     "ATA_DATETIME",
     "MOVEMENT_DATETIME",
@@ -111,7 +140,19 @@ STANDARDIZED_COLUMNS = RESULT_COLUMNS + [
     "DAT_MOVEMENT_TIME_DISPLAY",
     "STREAM_MOVEMENT_DATETIME",
     "STREAM_MOVEMENT_TIME_DISPLAY",
+    "DAT_RECOVERY_USED",
+    "DAT_RECOVERY_REASON",
+    "DAT_RECOVERY_SOURCE_DATE",
+    "DAT_RECOVERY_SOURCE_ROW",
+    "ORIGINAL_DAT_DATE",
+    "RECOVERED_DAT_DATE",
+    "USED_FOR_RECOVERY",
 ]
+
+
+def is_excluded_flight_number(flight_number: object) -> bool:
+    """Hard filter for non-billable/internal callsigns."""
+    return _is_excluded_flight_number(flight_number)
 
 
 def read_uploaded_table(data: bytes, filename: str) -> tuple[pd.DataFrame, str]:
@@ -201,6 +242,7 @@ def standardize_dataset(
 
         atd_datetime = normalized_times["ATD_DATETIME"]
         ata_datetime = normalized_times["ATA_DATETIME"]
+        eobt_datetime = normalize_eobt_datetime(date_of_flight, raw["eobt"])
         move_datetime = movement_datetime(move, atd_datetime, ata_datetime)
         flight_date_value = (
             pd.Timestamp(date_of_flight).date()
@@ -236,6 +278,8 @@ def standardize_dataset(
             "STREAM STATUS FLIGHT": normalize_code(raw["status_flight"]),
             "TIMESTAMP": normalize_display_text(raw["timestamp"]),
             "MESSAGE NUM": normalize_display_text(raw["message_num"]),
+            "EOBT": format_time(eobt_datetime) or normalize_display_text(raw["eobt"]),
+            "EOBT_DATETIME": eobt_datetime,
             "ATD_DATETIME": atd_datetime,
             "ATA_DATETIME": ata_datetime,
             "MOVEMENT_DATETIME": move_datetime,
@@ -245,6 +289,13 @@ def standardize_dataset(
             "MOVEMENT_DATE_DIFFERS_FROM_FLIGHT_DATE": movement_date_differs,
             "RAW ATD": clean_text(raw["atd"]),
             "RAW ATA": clean_text(raw["ata"]),
+            "DAT_RECOVERY_USED": False,
+            "DAT_RECOVERY_REASON": "",
+            "DAT_RECOVERY_SOURCE_DATE": "",
+            "DAT_RECOVERY_SOURCE_ROW": "",
+            "ORIGINAL_DAT_DATE": "",
+            "RECOVERED_DAT_DATE": "",
+            "USED_FOR_RECOVERY": False,
         }
         if source_name == "STREAM":
             record["STREAM_MOVEMENT_DATETIME"] = move_datetime
@@ -258,6 +309,158 @@ def standardize_dataset(
             record["STREAM_MOVEMENT_TIME_DISPLAY"] = ""
         records.append(record)
     return pd.DataFrame(records, columns=STANDARDIZED_COLUMNS)
+
+
+def recover_adjacent_date_movements(dat_normalized: pd.DataFrame) -> pd.DataFrame:
+    """Recover missing DAT movement details from the next raw DAT date.
+
+    Recovery intentionally runs on the normalized, non-deduplicated DAT pool. A
+    source record can be consumed only once and is later retained as an audit
+    duplicate instead of being reconciled a second time.
+    """
+    working = dat_normalized.copy().reset_index(drop=True)
+    if working.empty:
+        return working
+
+    for column, default in (
+        ("DAT_RECOVERY_USED", False),
+        ("DAT_RECOVERY_REASON", ""),
+        ("DAT_RECOVERY_SOURCE_DATE", ""),
+        ("DAT_RECOVERY_SOURCE_ROW", ""),
+        ("ORIGINAL_DAT_DATE", ""),
+        ("RECOVERED_DAT_DATE", ""),
+        ("USED_FOR_RECOVERY", False),
+    ):
+        if column not in working.columns:
+            working[column] = default
+
+    parsed_dates = pd.to_datetime(working["DATE OF FLIGHT"], errors="coerce")
+    order = working.assign(__date_order=parsed_dates).sort_values(
+        ["__date_order", "SOURCE ROW"], kind="stable"
+    ).index
+    identity_columns = ["FLIGHT NUMBER", "AERODROME", "TO FROM", "D/A/L/O"]
+    recover_display_fields = [
+        "AC REGISTER",
+        "ATD",
+        "ATA",
+        "ARRIVAL GATE",
+        "DEPARTURE GATE",
+        "DEPARTURE RUNWAY",
+        "ARRIVAL RUNWAY",
+    ]
+    recover_internal_fields = [
+        "ATD_DATETIME",
+        "ATA_DATETIME",
+        "RAW ATD",
+        "RAW ATA",
+    ]
+
+    for index in order:
+        row = working.loc[index]
+        movement = normalize_code(row["D/A/L/O"])
+        if movement not in {"A", "D"}:
+            continue
+        movement_column = "ATA_DATETIME" if movement == "A" else "ATD_DATETIME"
+        if _timestamp(row[movement_column]) is not None:
+            continue
+
+        original_date = pd.to_datetime(row["DATE OF FLIGHT"], errors="coerce")
+        if pd.isna(original_date):
+            continue
+        original_date = pd.Timestamp(original_date).normalize()
+        recovery_date = original_date + pd.Timedelta(days=1)
+        window_start = original_date + pd.Timedelta(hours=23)
+        window_end = recovery_date + pd.Timedelta(hours=6)
+
+        candidate_mask = ~working["USED_FOR_RECOVERY"].fillna(False).astype(bool)
+        candidate_mask &= parsed_dates.eq(recovery_date)
+        for column in identity_columns:
+            candidate_mask &= working[column].map(normalize_code).eq(
+                normalize_code(row[column])
+            )
+        register = normalize_code(row["AC REGISTER"])
+        if register:
+            candidate_mask &= working["AC REGISTER"].map(normalize_code).eq(register)
+        candidate_mask.loc[index] = False
+
+        candidate_indices = working.index[candidate_mask]
+        evaluations: list[tuple[tuple[object, ...], int, pd.Timestamp]] = []
+        eobt_datetime = _timestamp(row.get("EOBT_DATETIME")) or window_start
+        for candidate_index in candidate_indices:
+            candidate_datetime = _timestamp(
+                working.at[candidate_index, movement_column]
+            )
+            if candidate_datetime is None:
+                continue
+            if candidate_datetime < window_start or candidate_datetime > window_end:
+                continue
+            if candidate_datetime < eobt_datetime:
+                continue
+            time_distance = abs(
+                (candidate_datetime - eobt_datetime).total_seconds()
+            )
+            candidate_timestamp = parse_priority_timestamp(
+                working.at[candidate_index, "TIMESTAMP"]
+            )
+            timestamp_priority = -(
+                candidate_timestamp.value if candidate_timestamp is not None else 0
+            )
+            evaluations.append(
+                (
+                    (
+                        time_distance,
+                        timestamp_priority,
+                        -parse_message_number(
+                            working.at[candidate_index, "MESSAGE NUM"]
+                        ),
+                        -int(working.at[candidate_index, "SOURCE ROW"]),
+                    ),
+                    int(candidate_index),
+                    candidate_datetime,
+                )
+            )
+        if not evaluations:
+            continue
+
+        _, candidate_index, recovered_movement_datetime = min(
+            evaluations, key=lambda item: item[0]
+        )
+        candidate = working.loc[candidate_index]
+        for column in recover_display_fields + recover_internal_fields:
+            if not is_present(working.at[index, column]) and is_present(candidate[column]):
+                working.at[index, column] = candidate[column]
+
+        recovered_atd = _timestamp(working.at[index, "ATD_DATETIME"])
+        recovered_ata = _timestamp(working.at[index, "ATA_DATETIME"])
+        recovered_movement_datetime = movement_datetime(
+            movement, recovered_atd, recovered_ata
+        ) or recovered_movement_datetime
+        working.at[index, "MOVEMENT_DATETIME"] = recovered_movement_datetime
+        working.at[index, "DAT_MOVEMENT_DATETIME"] = recovered_movement_datetime
+        working.at[index, "MOVEMENT_TIME_DISPLAY"] = format_time(
+            recovered_movement_datetime
+        )
+        working.at[index, "DAT_MOVEMENT_TIME_DISPLAY"] = format_time(
+            recovered_movement_datetime
+        )
+        working.at[index, "ACTUAL MOVEMENT DATE"] = recovered_movement_datetime.strftime(
+            "%Y-%m-%d"
+        )
+        working.at[index, "MOVEMENT_DATE_DIFFERS_FROM_FLIGHT_DATE"] = True
+        working.at[index, "DAT_RECOVERY_USED"] = True
+        working.at[index, "DAT_RECOVERY_REASON"] = (
+            "ADJACENT DATE MIDNIGHT RECOVERY"
+        )
+        working.at[index, "DAT_RECOVERY_SOURCE_DATE"] = candidate["DATE OF FLIGHT"]
+        working.at[index, "DAT_RECOVERY_SOURCE_ROW"] = int(candidate["SOURCE ROW"])
+        working.at[index, "ORIGINAL_DAT_DATE"] = row["DATE OF FLIGHT"]
+        working.at[index, "RECOVERED_DAT_DATE"] = candidate["DATE OF FLIGHT"]
+        working.at[candidate_index, "USED_FOR_RECOVERY"] = True
+        working.at[candidate_index, "DAT_RECOVERY_REASON"] = (
+            "USED AS ADJACENT DATE MIDNIGHT RECOVERY SOURCE"
+        )
+
+    return working
 
 
 def _prepare_keys(frame: pd.DataFrame, side: str) -> pd.DataFrame:
@@ -302,9 +505,148 @@ def _duplicate_reason(row: pd.Series, selected: pd.Series) -> str:
     return "LOWER PRIORITY DUPLICATE; STABLE TIE-BREAK"
 
 
+def _movement_time_bucket(value: object, hours: int = 6) -> str:
+    timestamp = _timestamp(value)
+    if timestamp is None:
+        return "NO-TIME"
+    bucket_hour = (timestamp.hour // hours) * hours
+    return f"{bucket_hour:02d}-{bucket_hour + hours - 1:02d}"
+
+
+def _assign_flight_instance_keys(working: pd.DataFrame) -> pd.DataFrame:
+    """Resolve DAT records into movement instances before selecting duplicates."""
+    result = working.copy()
+    result["MOVEMENT_TIME_BUCKET"] = result["DAT_MOVEMENT_DATETIME"].map(
+        _movement_time_bucket
+    )
+    result["FLIGHT_INSTANCE_KEY"] = ""
+    key_columns = [f"__key_{field}" for _, field in MATCH_KEY_SPECS]
+
+    for _, group in result.groupby(key_columns, dropna=False, sort=False):
+        active = group.loc[~group["USED_FOR_RECOVERY"].fillna(False).astype(bool)]
+        movement_rows = active.loc[active["DAT_MOVEMENT_DATETIME"].notna()].copy()
+        resolved_register: dict[int, str] = {}
+
+        if not movement_rows.empty:
+            movement_rows["__actual_date"] = movement_rows[
+                "DAT_MOVEMENT_DATETIME"
+            ].map(lambda value: pd.Timestamp(value).strftime("%Y-%m-%d"))
+            movement_rows["__bucket"] = movement_rows["DAT_MOVEMENT_DATETIME"].map(
+                _movement_time_bucket
+            )
+            for _, same_slot in movement_rows.groupby(
+                ["__actual_date", "__bucket"], sort=False
+            ):
+                registers = {
+                    normalize_code(value)
+                    for value in same_slot["AC REGISTER"]
+                    if normalize_code(value)
+                }
+                slot_register = next(iter(registers)) if len(registers) == 1 else ""
+                for row_index, slot_row in same_slot.iterrows():
+                    resolved_register[int(row_index)] = (
+                        normalize_code(slot_row["AC REGISTER"]) or slot_register
+                    )
+
+        movement_instance_map: dict[tuple[str, str, str], dict[str, object]] = {}
+        for row_index, movement_row in movement_rows.iterrows():
+            movement_dt = pd.Timestamp(movement_row["DAT_MOVEMENT_DATETIME"])
+            actual_date = movement_dt.strftime("%Y-%m-%d")
+            bucket = _movement_time_bucket(movement_dt)
+            register = resolved_register.get(
+                int(row_index), normalize_code(movement_row["AC REGISTER"])
+            )
+            instance_token = (actual_date, bucket, register)
+            existing = movement_instance_map.get(instance_token)
+            candidate = {
+                "index": int(row_index),
+                "datetime": movement_dt,
+                "actual_date": actual_date,
+                "bucket": bucket,
+                "register": register,
+            }
+            if existing is None or movement_dt < existing["datetime"]:
+                movement_instance_map[instance_token] = candidate
+        movement_instances = list(movement_instance_map.values())
+
+        for row_index, row in group.iterrows():
+            if bool(row.get("USED_FOR_RECOVERY", False)):
+                actual_date = clean_text(row.get("ACTUAL MOVEMENT DATE"))
+                bucket = _movement_time_bucket(row.get("DAT_MOVEMENT_DATETIME"))
+                register = normalize_code(row.get("AC REGISTER"))
+                suffix = f"RECOVERY-SOURCE-{row.get('SOURCE DATA', '')}-{row.get('SOURCE ROW', '')}"
+            else:
+                movement_dt = _timestamp(row.get("DAT_MOVEMENT_DATETIME"))
+                if movement_dt is not None:
+                    actual_date = movement_dt.strftime("%Y-%m-%d")
+                    bucket = _movement_time_bucket(movement_dt)
+                    register = resolved_register.get(
+                        int(row_index), normalize_code(row.get("AC REGISTER"))
+                    )
+                    suffix = ""
+                else:
+                    row_register = normalize_code(row.get("AC REGISTER"))
+                    candidates = movement_instances
+                    matching_register = [
+                        item
+                        for item in candidates
+                        if row_register and item["register"] == row_register
+                    ]
+                    if matching_register:
+                        candidates = matching_register
+                    eobt_datetime = _timestamp(row.get("EOBT_DATETIME"))
+                    selected_instance = None
+                    if len(candidates) == 1:
+                        selected_instance = candidates[0]
+                    elif candidates and eobt_datetime is not None:
+                        selected_instance = min(
+                            candidates,
+                            key=lambda item: abs(
+                                (item["datetime"] - eobt_datetime).total_seconds()
+                            ),
+                        )
+                    if selected_instance is not None:
+                        actual_date = str(selected_instance["actual_date"])
+                        bucket = str(selected_instance["bucket"])
+                        register = str(selected_instance["register"] or row_register)
+                        suffix = ""
+                    else:
+                        fallback_datetime = _timestamp(row.get("EOBT_DATETIME"))
+                        actual_date = clean_text(row.get("DATE OF FLIGHT"))
+                        bucket = _movement_time_bucket(fallback_datetime)
+                        register = row_register
+                        suffix = (
+                            f"AMBIGUOUS-{row.get('SOURCE DATA', '')}-{row.get('SOURCE ROW', '')}"
+                            if candidates
+                            else ""
+                        )
+
+            instance_values = [
+                row.get("DATE OF FLIGHT", ""),
+                row.get("FLIGHT NUMBER", ""),
+                row.get("AERODROME", ""),
+                row.get("TO FROM", ""),
+                row.get("D/A/L/O", ""),
+                register,
+                actual_date,
+                bucket,
+            ]
+            if suffix:
+                instance_values.append(suffix)
+            instance_key = duplicate_group_key(instance_values)
+            result.at[row_index, "MOVEMENT_TIME_BUCKET"] = bucket
+            result.at[row_index, "FLIGHT_INSTANCE_KEY"] = instance_key
+
+    result["DUPLICATE_GROUP_KEY"] = result["FLIGHT_INSTANCE_KEY"]
+    return result
+
+
 def deduplicate_dat(dat_prepared: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Select exactly one best DAT record per complete base key."""
+    """Select one best DAT record per flight instance after recovery."""
     working = dat_prepared.copy()
+    if "USED_FOR_RECOVERY" not in working.columns:
+        working["USED_FOR_RECOVERY"] = False
+    working = _assign_flight_instance_keys(working)
     working["COMPLETENESS_SCORE"] = working[COMPLETENESS_FIELDS].apply(
         lambda row: sum(is_present(value) for value in row), axis=1
     )
@@ -315,9 +657,12 @@ def deduplicate_dat(dat_prepared: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFr
     )
     working["__message_number"] = working["MESSAGE NUM"].map(parse_message_number)
 
-    key_columns = [f"__key_{field}" for _, field in MATCH_KEY_SPECS]
-    complete = working.loc[working["__complete_key"]].sort_values(
-        key_columns
+    eligible = working.loc[
+        working["__complete_key"]
+        & ~working["USED_FOR_RECOVERY"].fillna(False).astype(bool)
+    ]
+    complete = eligible.sort_values(
+        ["FLIGHT_INSTANCE_KEY"]
         + [
             "HAS_MOVEMENT_TIME",
             "COMPLETENESS_SCORE",
@@ -325,14 +670,17 @@ def deduplicate_dat(dat_prepared: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFr
             "__message_number",
             "SOURCE ROW",
         ],
-        ascending=[True] * len(key_columns) + [False, False, False, False, False],
+        ascending=[True, False, False, False, False, False],
         kind="stable",
     )
     selected_complete_indices = complete.groupby(
-        key_columns, dropna=False, sort=False
+        "FLIGHT_INSTANCE_KEY", dropna=False, sort=False
     ).head(1).index
     selected_indices = set(selected_complete_indices) | set(
-        working.index[~working["__complete_key"]]
+        working.index[
+            ~working["__complete_key"]
+            & ~working["USED_FOR_RECOVERY"].fillna(False).astype(bool)
+        ]
     )
     working["SELECTED_RECORD_FLAG"] = working.index.map(
         lambda index: index in selected_indices
@@ -341,14 +689,19 @@ def deduplicate_dat(dat_prepared: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFr
     dat_unique = working.loc[working["SELECTED_RECORD_FLAG"]].copy()
     duplicate_dat = working.loc[~working["SELECTED_RECORD_FLAG"]].copy()
     selected_by_key = {
-        str(row["__match_key"]): row for _, row in dat_unique.iterrows()
+        str(row["FLIGHT_INSTANCE_KEY"]): row for _, row in dat_unique.iterrows()
     }
     if not duplicate_dat.empty:
+        def duplicate_reason(row: pd.Series) -> str:
+            if bool(row.get("USED_FOR_RECOVERY", False)):
+                return "USED FOR ADJACENT DATE MIDNIGHT RECOVERY"
+            selected = selected_by_key.get(str(row["FLIGHT_INSTANCE_KEY"]))
+            if selected is None:
+                return "NON-SELECTED FLIGHT INSTANCE"
+            return _duplicate_reason(row, selected)
+
         duplicate_dat["DUPLICATE_REASON"] = duplicate_dat.apply(
-            lambda row: _duplicate_reason(
-                row, selected_by_key[str(row["__match_key"])]
-            ),
-            axis=1,
+            duplicate_reason, axis=1
         )
     else:
         duplicate_dat["DUPLICATE_REASON"] = pd.Series(dtype=object)
@@ -438,6 +791,8 @@ def _result_from_dat(
     reason: str,
     selected_evaluation: Mapping[str, object] | None,
 ) -> dict[str, object]:
+    if bool(dat_row.get("DAT_RECOVERY_USED", False)):
+        reason = f"{reason} / DAT RECOVERED FROM NEXT DATE"
     result = {column: dat_row.get(column, "") for column in RESULT_COLUMNS}
     stream_row = (
         selected_evaluation.get("stream_row") if selected_evaluation else None
@@ -476,11 +831,20 @@ def _result_from_dat(
             "SELECTED DAT RECORD": True,
             "STREAM MATCH KEY": dat_row["DUPLICATE_GROUP_KEY"],
             "STREAM VALIDATION RESULT": validation_result,
-            "BILLING CATEGORY": (
-                "NON-BILLABLE/INTERNAL REVIEW"
-                if is_non_billable_flight(dat_row["FLIGHT NUMBER"])
-                else "BILLING REVIEW"
+            "BILLING CATEGORY": "BILLING REVIEW",
+            "DAT_RECOVERY_USED": bool(dat_row.get("DAT_RECOVERY_USED", False)),
+            "DAT_RECOVERY_REASON": dat_row.get("DAT_RECOVERY_REASON", ""),
+            "DAT_RECOVERY_SOURCE_DATE": dat_row.get(
+                "DAT_RECOVERY_SOURCE_DATE", ""
             ),
+            "DAT_RECOVERY_SOURCE_ROW": dat_row.get(
+                "DAT_RECOVERY_SOURCE_ROW", ""
+            ),
+            "ORIGINAL_DAT_DATE": dat_row.get("ORIGINAL_DAT_DATE", ""),
+            "RECOVERED_DAT_DATE": dat_row.get("RECOVERED_DAT_DATE", ""),
+            "USED_FOR_RECOVERY": bool(dat_row.get("USED_FOR_RECOVERY", False)),
+            "FLIGHT_INSTANCE_KEY": dat_row.get("FLIGHT_INSTANCE_KEY", ""),
+            "MOVEMENT_TIME_BUCKET": dat_row.get("MOVEMENT_TIME_BUCKET", ""),
         }
     )
     if isinstance(stream_row, pd.Series):
@@ -507,6 +871,15 @@ def _result_from_stream(stream_row: pd.Series) -> dict[str, object]:
             "STREAM MATCH KEY": stream_row["DUPLICATE_GROUP_KEY"],
             "STREAM VALIDATION RESULT": "DAT NOT FOUND",
             "BILLING CATEGORY": "",
+            "DAT_RECOVERY_USED": False,
+            "DAT_RECOVERY_REASON": "",
+            "DAT_RECOVERY_SOURCE_DATE": "",
+            "DAT_RECOVERY_SOURCE_ROW": "",
+            "ORIGINAL_DAT_DATE": "",
+            "RECOVERED_DAT_DATE": "",
+            "USED_FOR_RECOVERY": False,
+            "FLIGHT_INSTANCE_KEY": "",
+            "MOVEMENT_TIME_BUCKET": stream_row.get("MOVEMENT_TIME_BUCKET", ""),
         }
     )
     return result
@@ -544,6 +917,28 @@ def _duplicate_output(duplicates: pd.DataFrame) -> pd.DataFrame:
     ).reset_index(drop=True)
 
 
+def _excluded_output(dat_excluded: pd.DataFrame, stream_excluded: pd.DataFrame) -> pd.DataFrame:
+    records = [
+        record
+        for frame in (dat_excluded, stream_excluded)
+        for record in frame.to_dict("records")
+    ]
+    columns = RESULT_COLUMNS + [
+        "SOURCE DATA",
+        "SOURCE ROW",
+        "STATUS",
+        "MATCH_REASON",
+    ]
+    if not records:
+        return pd.DataFrame(columns=columns)
+    output = pd.DataFrame.from_records(records)
+    output["STATUS"] = "EXCLUDED NON-BILLABLE"
+    output["MATCH_REASON"] = "FLIGHT NUMBER MATCHES INTERNAL/NON-BILLABLE RULE"
+    return output[columns].sort_values(
+        ["SOURCE DATA", "DATE OF FLIGHT", "FLIGHT NUMBER"], kind="stable"
+    ).reset_index(drop=True)
+
+
 def reconcile_dat_vs_stream(
     dat_dep: pd.DataFrame,
     dat_arr: pd.DataFrame,
@@ -569,20 +964,40 @@ def reconcile_dat_vs_stream(
         for value in (invalid_stream_statuses or DEFAULT_INVALID_STREAM_STATUSES)
         if normalize_code(value)
     }
-    dep = standardize_dataset(dat_dep, dep_mapping, "DAT DEP", "D")
-    arr = standardize_dataset(dat_arr, arr_mapping, "DAT ARR", "A")
-    stream_standard = standardize_dataset(stream, stream_mapping, "STREAM")
-    if dep.empty:
-        dat_combined = arr.copy().reset_index(drop=True)
-    elif arr.empty:
-        dat_combined = dep.copy().reset_index(drop=True)
+    dep_normalized = standardize_dataset(dat_dep, dep_mapping, "DAT DEP", "D")
+    arr_normalized = standardize_dataset(dat_arr, arr_mapping, "DAT ARR", "A")
+    stream_normalized = standardize_dataset(stream, stream_mapping, "STREAM")
+    if dep_normalized.empty:
+        dat_combined_normalized = arr_normalized.copy().reset_index(drop=True)
+    elif arr_normalized.empty:
+        dat_combined_normalized = dep_normalized.copy().reset_index(drop=True)
     else:
-        dat_combined = pd.DataFrame.from_records(
-            dep.to_dict("records") + arr.to_dict("records"),
+        dat_combined_normalized = pd.DataFrame.from_records(
+            dep_normalized.to_dict("records") + arr_normalized.to_dict("records"),
             columns=STANDARDIZED_COLUMNS,
         )
 
-    dat_prepared = _prepare_keys(dat_combined, "DAT")
+    dat_excluded_mask = dat_combined_normalized["FLIGHT NUMBER"].map(
+        is_excluded_flight_number
+    )
+    stream_excluded_mask = stream_normalized["FLIGHT NUMBER"].map(
+        is_excluded_flight_number
+    )
+    dat_excluded = dat_combined_normalized.loc[dat_excluded_mask].copy()
+    stream_excluded = stream_normalized.loc[stream_excluded_mask].copy()
+    dat_combined = dat_combined_normalized.loc[~dat_excluded_mask].copy().reset_index(
+        drop=True
+    )
+    stream_standard = stream_normalized.loc[~stream_excluded_mask].copy().reset_index(
+        drop=True
+    )
+    dep = dat_combined.loc[dat_combined["SOURCE DATA"].eq("DAT DEP")].copy()
+    arr = dat_combined.loc[dat_combined["SOURCE DATA"].eq("DAT ARR")].copy()
+    raw_dat_normalized = dat_combined.copy(deep=True)
+    dat_recovered = recover_adjacent_date_movements(raw_dat_normalized)
+    excluded_non_billable = _excluded_output(dat_excluded, stream_excluded)
+
+    dat_prepared = _prepare_keys(dat_recovered, "DAT")
     stream_prepared = _prepare_keys(stream_standard, "STREAM")
     dat_unique, duplicate_raw = deduplicate_dat(dat_prepared)
     duplicate_dat = _duplicate_output(duplicate_raw)
@@ -683,7 +1098,9 @@ def reconcile_dat_vs_stream(
                 "STATUS": "DUPLICATE DAT",
                 "MATCH_REASON": duplicate_row.get("DUPLICATE_REASON", ""),
                 "STREAM STATUS FLIGHT": "",
-                "DAT MOVEMENT DATETIME": "",
+                "DAT MOVEMENT DATETIME": format_datetime(
+                    duplicate_row.get("DAT_MOVEMENT_DATETIME")
+                ),
                 "STREAM MOVEMENT DATETIME": "",
                 "TIME DIFFERENCE MINUTES": "",
                 "DUPLICATE GROUP KEY": duplicate_row.get(
@@ -692,24 +1109,39 @@ def reconcile_dat_vs_stream(
                 "SELECTED DAT RECORD": False,
                 "STREAM MATCH KEY": "",
                 "STREAM VALIDATION RESULT": "NOT APPLICABLE",
-                "BILLING CATEGORY": (
-                    "NON-BILLABLE/INTERNAL REVIEW"
-                    if is_non_billable_flight(duplicate_row.get("FLIGHT NUMBER", ""))
-                    else "BILLING REVIEW"
-                ),
+                "BILLING CATEGORY": "BILLING REVIEW",
                 "COMPLETENESS_SCORE": duplicate_row.get("COMPLETENESS_SCORE", ""),
                 "HAS_MOVEMENT_TIME": duplicate_row.get("HAS_MOVEMENT_TIME", ""),
+                "DAT_RECOVERY_USED": bool(
+                    duplicate_row.get("DAT_RECOVERY_USED", False)
+                ),
+                "DAT_RECOVERY_REASON": duplicate_row.get(
+                    "DAT_RECOVERY_REASON", ""
+                ),
+                "DAT_RECOVERY_SOURCE_DATE": duplicate_row.get(
+                    "DAT_RECOVERY_SOURCE_DATE", ""
+                ),
+                "DAT_RECOVERY_SOURCE_ROW": duplicate_row.get(
+                    "DAT_RECOVERY_SOURCE_ROW", ""
+                ),
+                "ORIGINAL_DAT_DATE": duplicate_row.get("ORIGINAL_DAT_DATE", ""),
+                "RECOVERED_DAT_DATE": duplicate_row.get("RECOVERED_DAT_DATE", ""),
+                "USED_FOR_RECOVERY": bool(
+                    duplicate_row.get("USED_FOR_RECOVERY", False)
+                ),
+                "FLIGHT_INSTANCE_KEY": duplicate_row.get(
+                    "FLIGHT_INSTANCE_KEY", ""
+                ),
+                "MOVEMENT_TIME_BUCKET": duplicate_row.get(
+                    "MOVEMENT_TIME_BUCKET", ""
+                ),
             }
         )
         audit_records.append(audit_record)
     audit_detail = _records_frame(audit_records)
 
-    missing_billing = missing.loc[
-        missing["BILLING CATEGORY"] == "BILLING REVIEW"
-    ].reset_index(drop=True)
-    missing_non_billable = missing.loc[
-        missing["BILLING CATEGORY"] == "NON-BILLABLE/INTERNAL REVIEW"
-    ].reset_index(drop=True)
+    missing_billing = missing.copy().reset_index(drop=True)
+    missing_non_billable = pd.DataFrame(columns=missing.columns)
 
     unique_dat_total = len(dat_unique)
     matched_total = len(matched)
@@ -727,6 +1159,8 @@ def reconcile_dat_vs_stream(
         "need_review": len(need_review),
         "extra_in_stream": len(extra),
         "duplicate_dat": len(duplicate_dat),
+        "excluded_dat_non_billable": len(dat_excluded),
+        "excluded_stream_non_billable": len(stream_excluded),
         "accuracy_percentage": accuracy,
         "incomplete_dat_keys": int((~dat_unique["__complete_key"]).sum()),
         "incomplete_stream_keys": int((~stream_prepared["__complete_key"]).sum()),
@@ -741,10 +1175,11 @@ def reconcile_dat_vs_stream(
             ("Matched", summary["matched"]),
             ("Missing in Stream", summary["missing_in_stream"]),
             ("Missing Billing Review", summary["missing_billing_review"]),
-            ("Missing Non-Billable/Internal Review", summary["missing_non_billable_review"]),
             ("Need Review", summary["need_review"]),
             ("Extra in Stream", summary["extra_in_stream"]),
             ("Duplicate DAT", summary["duplicate_dat"]),
+            ("Excluded DAT Non-Billable", summary["excluded_dat_non_billable"]),
+            ("Excluded STREAM Non-Billable", summary["excluded_stream_non_billable"]),
             ("Accuracy Percentage", summary["accuracy_percentage"] / 100),
         ],
         columns=["METRIC", "VALUE"],
@@ -760,10 +1195,13 @@ def reconcile_dat_vs_stream(
         "extra": extra,
         "duplicates": duplicate_dat,
         "audit_detail": audit_detail,
+        "excluded_non_billable": excluded_non_billable,
         "dat_unique": dat_unique,
         "dat_dep": dep,
         "dat_arr": arr,
         "stream": stream_standard,
+        "raw_dat_normalized": raw_dat_normalized,
+        "dat_recovered": dat_recovered,
         "settings": {
             "time_tolerance_minutes": time_tolerance_minutes,
             "invalid_stream_statuses": sorted(invalid_statuses),

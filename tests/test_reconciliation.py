@@ -85,6 +85,7 @@ class ReconciliationTests(unittest.TestCase):
                 "Extra in Stream",
                 "Duplicate DAT",
                 "Audit Detail",
+                "Excluded Non-Billable",
             ],
         )
         self.assertEqual(workbook["Summary"]["A1"].value, "FINDER — DAT vs STREAM Reconciliation Report")
@@ -112,6 +113,13 @@ class ReconciliationTests(unittest.TestCase):
                 "DAT MOVEMENT DATETIME",
                 "STREAM MOVEMENT DATETIME",
                 "TIME DIFFERENCE MINUTES",
+                "DAT_RECOVERY_USED",
+                "DAT_RECOVERY_REASON",
+                "DAT_RECOVERY_SOURCE_DATE",
+                "DAT_RECOVERY_SOURCE_ROW",
+                "ORIGINAL_DAT_DATE",
+                "RECOVERED_DAT_DATE",
+                "USED_FOR_RECOVERY",
             ],
         )
 
@@ -279,7 +287,7 @@ class ReconciliationTests(unittest.TestCase):
         self.assertEqual(reasons["TOL121"], "STREAM TIME MISMATCH")
         self.assertIn("STREAM INVALID ATD DATE", reasons["DATEBAD"])
 
-    def test_non_billable_flight_is_separated_from_billing_review(self):
+    def test_non_billable_flight_is_hard_excluded(self):
         dep = pd.DataFrame(
             {
                 "callsign": ["TEST1", "LNI777"],
@@ -301,8 +309,110 @@ class ReconciliationTests(unittest.TestCase):
         )
         result = reconcile_dat_vs_stream(dep, arr, stream)
         self.assertEqual(set(result["missing_billing"]["FLIGHT NUMBER"]), {"LNI777"})
+        self.assertTrue(result["missing_non_billable"].empty)
+        self.assertEqual(result["summary"]["excluded_dat_non_billable"], 1)
+        self.assertEqual(result["summary"]["total_dat_combined"], 1)
         self.assertEqual(
-            set(result["missing_non_billable"]["FLIGHT NUMBER"]), {"TEST1"}
+            set(result["excluded_non_billable"]["FLIGHT NUMBER"]), {"TEST1"}
+        )
+        for key in ("missing", "matched", "need_review", "extra", "duplicates", "audit_detail"):
+            self.assertNotIn("TEST1", set(result[key]["FLIGHT NUMBER"]))
+
+    def test_all_internal_keywords_are_excluded_from_dat_stream_and_outputs(self):
+        keywords = [
+            "LANDASAN", "RWYINS", "RWYINSP", "INSPCTN", "CAR", "VFR",
+            "IFR", "TEST", "TEST1", "TEST2", "MPS",
+        ]
+        callsigns = [f"X{keyword}9" for keyword in keywords]
+        dep = pd.DataFrame(
+            {
+                "callsign": callsigns + ["BILLABLE9"],
+                "adep": ["WIMM"] * (len(callsigns) + 1),
+                "ades": ["WIII"] * (len(callsigns) + 1),
+                "eobd": ["260620"] * (len(callsigns) + 1),
+                "atd": ["08:00"] * (len(callsigns) + 1),
+            }
+        )
+        arr = pd.DataFrame(columns=["callsign", "adep", "ades", "eobd"])
+        stream = pd.DataFrame(
+            {
+                "DATE OF FLIGHT": ["2026-06-20"] * len(callsigns),
+                "FLIGHT NUMBER": callsigns,
+                "AERODROME": ["WIMM"] * len(callsigns),
+                "TO FROM": ["WIII"] * len(callsigns),
+                "D/A/L/O": ["D"] * len(callsigns),
+                "ATD": ["08:00"] * len(callsigns),
+            }
+        )
+        result = reconcile_dat_vs_stream(dep, arr, stream)
+        self.assertEqual(result["summary"]["excluded_dat_non_billable"], len(callsigns))
+        self.assertEqual(result["summary"]["excluded_stream_non_billable"], len(callsigns))
+        self.assertEqual(result["summary"]["total_dat_combined"], 1)
+        self.assertEqual(result["summary"]["total_stream"], 0)
+        for key in ("missing", "matched", "need_review", "extra", "duplicates", "audit_detail"):
+            values = set(result[key]["FLIGHT NUMBER"])
+            self.assertTrue(values.isdisjoint(callsigns))
+
+    def test_ctv010_adjacent_date_midnight_recovery_precedes_deduplication(self):
+        dep = pd.DataFrame(columns=["callsign", "adep", "ades", "eobd"])
+        arr = pd.DataFrame(
+            {
+                "callsign": ["CTV010", "CTV010"],
+                "adep": ["WIHH", "WIHH"],
+                "ades": ["WIMM", "WIMM"],
+                "eobd": ["260623", "260624"],
+                "eobt": ["2340", "0045"],
+                "atd": ["", "2026-06-24 00:54"],
+                "ata": ["", "2026-06-24 02:52"],
+                "register": ["PKGLM", "PKGLM"],
+                "arrivalGate": ["", "27"],
+                "arrivalRunway": ["23", "23"],
+                "timeStamp": ["2026-06-24 01:49", "2026-06-24 04:52"],
+                "messageNum": ["52538", "52582"],
+            }
+        )
+        stream = pd.DataFrame(
+            columns=["DATE OF FLIGHT", "FLIGHT NUMBER", "AERODROME", "TO FROM", "D/A/L/O"]
+        )
+        result = reconcile_dat_vs_stream(dep, arr, stream)
+        recovered = result["missing"].iloc[0]
+        self.assertEqual(recovered["DATE OF FLIGHT"], "2026-06-23")
+        self.assertEqual(recovered["ACTUAL MOVEMENT DATE"], "2026-06-24")
+        self.assertEqual(recovered["ATD"], "00:54")
+        self.assertEqual(recovered["ATA"], "02:52")
+        self.assertEqual(recovered["ARRIVAL GATE"], "27")
+        self.assertEqual(recovered["ARRIVAL RUNWAY"], "23")
+        self.assertTrue(bool(recovered["DAT_RECOVERY_USED"]))
+        self.assertEqual(recovered["DAT_RECOVERY_SOURCE_DATE"], "2026-06-24")
+        self.assertEqual(int(recovered["DAT_RECOVERY_SOURCE_ROW"]), 3)
+        self.assertIn("DAT RECOVERED FROM NEXT DATE", recovered["MATCH_REASON"])
+        self.assertEqual(len(result["duplicates"]), 1)
+        self.assertTrue(bool(result["duplicates"].iloc[0]["USED_FOR_RECOVERY"]))
+
+    def test_actual_date_creates_distinct_flight_instances(self):
+        dep = pd.DataFrame(columns=["callsign", "adep", "ades", "eobd"])
+        arr = pd.DataFrame(
+            {
+                "callsign": ["CTV010", "CTV010"],
+                "adep": ["WIHH", "WIHH"],
+                "ades": ["WIMM", "WIMM"],
+                "eobd": ["260624", "260624"],
+                "atd": ["2026-06-24 00:54", "2026-06-25 00:09"],
+                "ata": ["2026-06-24 02:52", "2026-06-25 02:09"],
+                "register": ["PKGLM", "PKGLM"],
+                "arrivalGate": ["27", "28"],
+                "arrivalRunway": ["23", "23"],
+            }
+        )
+        stream = pd.DataFrame(
+            columns=["DATE OF FLIGHT", "FLIGHT NUMBER", "AERODROME", "TO FROM", "D/A/L/O"]
+        )
+        result = reconcile_dat_vs_stream(dep, arr, stream)
+        self.assertEqual(len(result["dat_unique"]), 2)
+        self.assertEqual(len(result["duplicates"]), 0)
+        self.assertEqual(
+            set(result["missing"]["ACTUAL MOVEMENT DATE"]),
+            {"2026-06-24", "2026-06-25"},
         )
 
     def test_overnight_arrival_keeps_eobd_and_actual_movement_date(self):

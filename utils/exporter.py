@@ -6,7 +6,7 @@ from typing import Mapping
 
 import pandas as pd
 
-from utils.reconciliation import RESULT_COLUMNS
+from utils.reconciliation import RECOVERY_AUDIT_COLUMNS, RESULT_COLUMNS
 
 
 MISSING_EXPORT_COLUMNS = RESULT_COLUMNS + [
@@ -15,7 +15,7 @@ MISSING_EXPORT_COLUMNS = RESULT_COLUMNS + [
     "DAT MOVEMENT DATETIME",
     "STREAM MOVEMENT DATETIME",
     "TIME DIFFERENCE MINUTES",
-]
+] + RECOVERY_AUDIT_COLUMNS
 
 
 def _select_columns(frame: pd.DataFrame, requested: list[str] | None) -> pd.DataFrame:
@@ -29,7 +29,7 @@ def _select_columns(frame: pd.DataFrame, requested: list[str] | None) -> pd.Data
 
 
 def build_excel_report(results: Mapping[str, object]) -> bytes:
-    """Create the seven-sheet FINDER audit workbook."""
+    """Create the eight-sheet FINDER audit workbook."""
     from openpyxl import Workbook
     from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
     from openpyxl.utils import get_column_letter
@@ -46,6 +46,7 @@ def build_excel_report(results: Mapping[str, object]) -> bytes:
         "Extra in Stream": "7567C7",
         "Duplicate DAT": "D99A1B",
         "Audit Detail": "53657D",
+        "Excluded Non-Billable": "64748B",
     }
 
     workbook = Workbook()
@@ -110,6 +111,7 @@ def build_excel_report(results: Mapping[str, object]) -> bytes:
         ("Extra in Stream", "extra", None),
         ("Duplicate DAT", "duplicates", None),
         ("Audit Detail", "audit_detail", None),
+        ("Excluded Non-Billable", "excluded_non_billable", None),
     ]
     thin = Side(style="thin", color=border_color)
     text_columns = {
@@ -123,6 +125,14 @@ def build_excel_report(results: Mapping[str, object]) -> bytes:
         "DEPARTURE RUNWAY",
         "ARRIVAL RUNWAY",
         "SOURCE ROW",
+    }
+    wrapped_columns = {
+        "MATCH_REASON",
+        "DUPLICATE_REASON",
+        "DAT_RECOVERY_REASON",
+        "STREAM VALIDATION RESULT",
+        "FLIGHT_INSTANCE_KEY",
+        "DUPLICATE_GROUP_KEY",
     }
     for sheet_name, result_key, requested_columns in sheet_specs:
         raw_frame = results[result_key]
@@ -150,10 +160,17 @@ def build_excel_report(results: Mapping[str, object]) -> bytes:
         for row_index, values in enumerate(
             frame.itertuples(index=False, name=None), start=5
         ):
+            longest_wrapped_value = 0
             for column_index, value in enumerate(values, start=1):
                 column_name = frame.columns[column_index - 1]
                 clean_value = "" if pd.isna(value) else value
-                if column_name in {"DATE OF FLIGHT", "ACTUAL MOVEMENT DATE"} and clean_value:
+                if column_name in {
+                    "DATE OF FLIGHT",
+                    "ACTUAL MOVEMENT DATE",
+                    "DAT_RECOVERY_SOURCE_DATE",
+                    "ORIGINAL_DAT_DATE",
+                    "RECOVERED_DAT_DATE",
+                } and clean_value:
                     try:
                         clean_value = datetime.strptime(
                             str(clean_value), "%Y-%m-%d"
@@ -161,8 +178,20 @@ def build_excel_report(results: Mapping[str, object]) -> bytes:
                     except ValueError:
                         pass
                 cell = sheet.cell(row_index, column_index, clean_value)
-                cell.alignment = Alignment(vertical="top")
-                if column_name in {"DATE OF FLIGHT", "ACTUAL MOVEMENT DATE"}:
+                cell.alignment = Alignment(
+                    vertical="top", wrap_text=column_name in wrapped_columns
+                )
+                if column_name in wrapped_columns:
+                    longest_wrapped_value = max(
+                        longest_wrapped_value, len(str(clean_value))
+                    )
+                if column_name in {
+                    "DATE OF FLIGHT",
+                    "ACTUAL MOVEMENT DATE",
+                    "DAT_RECOVERY_SOURCE_DATE",
+                    "ORIGINAL_DAT_DATE",
+                    "RECOVERED_DAT_DATE",
+                }:
                     cell.number_format = "yyyy-mm-dd"
                 elif column_name in text_columns:
                     cell.number_format = "@"
@@ -170,6 +199,9 @@ def build_excel_report(results: Mapping[str, object]) -> bytes:
                     cell.number_format = "0.0"
                 if row_index % 2:
                     cell.fill = PatternFill("solid", fgColor="F7F9FC")
+            if longest_wrapped_value > 38:
+                estimated_lines = (longest_wrapped_value + 37) // 38
+                sheet.row_dimensions[row_index].height = min(60, 15 * estimated_lines)
 
         if len(frame):
             sheet.auto_filter.ref = f"A4:{last_column}{len(frame) + 4}"
@@ -185,6 +217,8 @@ def build_excel_report(results: Mapping[str, object]) -> bytes:
             sheet.column_dimensions[get_column_letter(column_index)].width = max(
                 width, 11
             )
+            if column in wrapped_columns:
+                sheet.column_dimensions[get_column_letter(column_index)].width = 38
 
     buffer = io.BytesIO()
     workbook.save(buffer)

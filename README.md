@@ -17,7 +17,9 @@ Buka FINDER dari komputer, tablet, atau ponsel melalui:
 - Deduplikasi DAT berbasis movement time, completeness, timestamp, dan message number.
 - Validasi STREAM berdasarkan status flight dan selisih waktu 15/30/60 menit.
 - Hasil: Missing in Stream, Matched, Need Review, Extra in Stream, dan Duplicate DAT.
-- Pemisahan Missing Billing Review dari Non-Billable/Internal Review.
+- Hard exclude Non-Billable/Internal Movement sebelum recovery, deduplikasi, dan reconciliation.
+- Adjacent Date / Midnight Recovery dari RAW DAT yang sudah dinormalisasi.
+- Deduplikasi per flight instance agar pergerakan berbeda tidak saling menimpa.
 - Audit reason untuk setiap hasil dan candidate STREAM.
 - Kolom Actual Movement Date dari ATA untuk arrival atau ATD untuk departure, tanpa mengubah EOBD sebagai base key.
 - Filter Missing in Stream berdasarkan tanggal, flight number, aerodrome, TO FROM, dan movement.
