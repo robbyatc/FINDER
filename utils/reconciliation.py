@@ -61,6 +61,8 @@ AUDIT_COLUMNS = [
     "SELECTED DAT RECORD",
     "STREAM MATCH KEY",
     "STREAM VALIDATION RESULT",
+    "STREAM MATCH DATE USED",
+    "STREAM MATCH MODE",
     "BILLING CATEGORY",
     "DAT_RECOVERY_USED",
     "DAT_RECOVERY_REASON",
@@ -97,6 +99,8 @@ RECOVERY_AUDIT_COLUMNS = [
     "ORIGINAL_DAT_DATE",
     "RECOVERED_DAT_DATE",
     "USED_FOR_RECOVERY",
+    "STREAM MATCH DATE USED",
+    "STREAM MATCH MODE",
 ]
 
 MATCH_KEY_SPECS = [
@@ -725,15 +729,78 @@ def _timestamp(value: object) -> pd.Timestamp | None:
     return pd.Timestamp(value)
 
 
+def _match_key_for_date(row: pd.Series, match_date: object) -> str | None:
+    values = [
+        normalize_date(match_date),
+        normalize_code(row.get("FLIGHT NUMBER", "")),
+        normalize_code(row.get("AERODROME", "")),
+        normalize_code(row.get("TO FROM", "")),
+        normalize_code(row.get("D/A/L/O", "")),
+    ]
+    if not all(values):
+        return None
+    return "␟".join(values)
+
+
+def _stream_search_specs(dat_row: pd.Series) -> list[dict[str, str]]:
+    """Return ordered original, recovered, then actual-date STREAM lookup keys."""
+    requested = [
+        (
+            dat_row.get("DATE OF FLIGHT", ""),
+            "DATE OF FLIGHT",
+            "ORIGINAL DATE MATCH",
+        )
+    ]
+    if bool(dat_row.get("DAT_RECOVERY_USED", False)):
+        requested.append(
+            (
+                dat_row.get("RECOVERED_DAT_DATE", ""),
+                "RECOVERED_DAT_DATE",
+                "RECOVERED DATE MATCH",
+            )
+        )
+    requested.append(
+        (
+            dat_row.get("ACTUAL MOVEMENT DATE", ""),
+            "ACTUAL MOVEMENT DATE",
+            "ACTUAL MOVEMENT DATE MATCH",
+        )
+    )
+
+    specs: list[dict[str, str]] = []
+    seen_keys: set[str] = set()
+    for match_date, date_used, mode in requested:
+        key = _match_key_for_date(dat_row, match_date)
+        if key is None or key in seen_keys:
+            continue
+        seen_keys.add(key)
+        specs.append(
+            {
+                "key": key,
+                "date_used": date_used,
+                "mode": mode,
+                "date_value": normalize_date(match_date),
+            }
+        )
+    return specs
+
+
 def _candidate_evaluation(
     dat_row: pd.Series,
     stream_row: pd.Series,
     invalid_statuses: set[str],
     treat_invalid_status_as_missing: bool,
+    match_date_used: str,
+    match_mode: str,
 ) -> dict[str, object]:
     dat_datetime = _timestamp(dat_row["DAT_MOVEMENT_DATETIME"])
     stream_datetime = _timestamp(stream_row["STREAM_MOVEMENT_DATETIME"])
     stream_status = normalize_code(stream_row["STREAM STATUS FLIGHT"])
+    dat_register = normalize_code(dat_row.get("AC REGISTER", ""))
+    stream_register = normalize_code(stream_row.get("AC REGISTER", ""))
+    register_mismatch = bool(
+        dat_register and stream_register and dat_register != stream_register
+    )
     invalid_status = bool(
         treat_invalid_status_as_missing and stream_status in invalid_statuses
     )
@@ -755,6 +822,8 @@ def _candidate_evaluation(
         invalid_reasons.append("STREAM INVALID MOVEMENT TIME")
     if date_mismatch:
         invalid_reasons.append(f"STREAM INVALID {movement_field} DATE")
+    if register_mismatch:
+        invalid_reasons.append("STREAM AC REGISTER MISMATCH")
 
     priority_timestamp = parse_priority_timestamp(stream_row["TIMESTAMP"])
     priority_value = (
@@ -764,12 +833,18 @@ def _candidate_evaluation(
         1 if invalid_status else 0,
         1 if stream_datetime is None else 0,
         1 if date_mismatch else 0,
+        1 if register_mismatch else 0,
         time_difference if time_difference is not None else float("inf"),
         priority_value,
         -parse_message_number(stream_row["MESSAGE NUM"]),
         -int(stream_row["SOURCE ROW"]),
     )
-    validation_result = "VALID STREAM CANDIDATE"
+    validation_result = {
+        "RECOVERED DATE MATCH": "VALID STREAM CANDIDATE BY RECOVERED DATE",
+        "ACTUAL MOVEMENT DATE MATCH": (
+            "VALID STREAM CANDIDATE BY ACTUAL MOVEMENT DATE"
+        ),
+    }.get(match_mode, "VALID STREAM CANDIDATE")
     if invalid_reasons:
         validation_result = " / ".join(invalid_reasons)
     return {
@@ -779,8 +854,11 @@ def _candidate_evaluation(
         "stream_datetime": stream_datetime,
         "time_difference": time_difference,
         "date_mismatch": date_mismatch,
+        "register_mismatch": register_mismatch,
         "invalid_reasons": invalid_reasons,
         "validation_result": validation_result,
+        "match_date_used": match_date_used,
+        "match_mode": match_mode,
         "selection_sort": selection_sort,
     }
 
@@ -791,8 +869,6 @@ def _result_from_dat(
     reason: str,
     selected_evaluation: Mapping[str, object] | None,
 ) -> dict[str, object]:
-    if bool(dat_row.get("DAT_RECOVERY_USED", False)):
-        reason = f"{reason} / DAT RECOVERED FROM NEXT DATE"
     result = {column: dat_row.get(column, "") for column in RESULT_COLUMNS}
     stream_row = (
         selected_evaluation.get("stream_row") if selected_evaluation else None
@@ -810,6 +886,14 @@ def _result_from_dat(
         selected_evaluation.get("validation_result", "STREAM NOT FOUND")
         if selected_evaluation
         else "STREAM NOT FOUND"
+    )
+    match_date_used = (
+        selected_evaluation.get("match_date_used", "") if selected_evaluation else ""
+    )
+    match_mode = (
+        selected_evaluation.get("match_mode", "NO STREAM MATCH")
+        if selected_evaluation
+        else "NO STREAM MATCH"
     )
     result.update(
         {
@@ -831,6 +915,8 @@ def _result_from_dat(
             "SELECTED DAT RECORD": True,
             "STREAM MATCH KEY": dat_row["DUPLICATE_GROUP_KEY"],
             "STREAM VALIDATION RESULT": validation_result,
+            "STREAM MATCH DATE USED": match_date_used,
+            "STREAM MATCH MODE": match_mode,
             "BILLING CATEGORY": "BILLING REVIEW",
             "DAT_RECOVERY_USED": bool(dat_row.get("DAT_RECOVERY_USED", False)),
             "DAT_RECOVERY_REASON": dat_row.get("DAT_RECOVERY_REASON", ""),
@@ -870,6 +956,8 @@ def _result_from_stream(stream_row: pd.Series) -> dict[str, object]:
             "SELECTED DAT RECORD": False,
             "STREAM MATCH KEY": stream_row["DUPLICATE_GROUP_KEY"],
             "STREAM VALIDATION RESULT": "DAT NOT FOUND",
+            "STREAM MATCH DATE USED": "",
+            "STREAM MATCH MODE": "NO STREAM MATCH",
             "BILLING CATEGORY": "",
             "DAT_RECOVERY_USED": False,
             "DAT_RECOVERY_REASON": "",
@@ -1008,7 +1096,11 @@ def reconcile_dat_vs_stream(
             stream_prepared["__complete_key"]
         ].groupby("__match_key", sort=False)
     }
-    dat_keys = set(dat_unique.loc[dat_unique["__complete_key"], "__match_key"])
+    dat_keys: set[str] = set()
+    for _, keyed_dat_row in dat_unique.loc[dat_unique["__complete_key"]].iterrows():
+        dat_keys.update(
+            spec["key"] for spec in _stream_search_specs(keyed_dat_row)
+        )
 
     matched_records: list[dict[str, object]] = []
     missing_records: list[dict[str, object]] = []
@@ -1016,14 +1108,29 @@ def reconcile_dat_vs_stream(
     audit_records: list[dict[str, object]] = []
 
     for _, dat_row in dat_unique.iterrows():
-        candidates = stream_groups.get(str(dat_row["__match_key"]))
+        search_specs = _stream_search_specs(dat_row)
+        selected_search_spec: dict[str, str] | None = None
+        candidates: pd.DataFrame | None = None
+        for search_spec in search_specs:
+            candidate_group = stream_groups.get(search_spec["key"])
+            if candidate_group is not None and not candidate_group.empty:
+                selected_search_spec = search_spec
+                candidates = candidate_group
+                break
         if candidates is None or candidates.empty:
+            not_found_reason = (
+                "STREAM NOT FOUND AFTER ORIGINAL AND RECOVERED DATE SEARCH"
+                if bool(dat_row.get("DAT_RECOVERY_USED", False))
+                else "STREAM NOT FOUND"
+            )
             result = _result_from_dat(
-                dat_row, "MISSING IN STREAM", "STREAM NOT FOUND", None
+                dat_row, "MISSING IN STREAM", not_found_reason, None
             )
             missing_records.append(result)
             audit_records.append(result.copy())
             continue
+
+        assert selected_search_spec is not None
 
         evaluations = [
             _candidate_evaluation(
@@ -1031,6 +1138,8 @@ def reconcile_dat_vs_stream(
                 stream_row,
                 invalid_statuses,
                 treat_invalid_stream_status_as_missing,
+                selected_search_spec["date_used"],
+                selected_search_spec["mode"],
             )
             for _, stream_row in candidates.iterrows()
         ]
@@ -1045,7 +1154,12 @@ def reconcile_dat_vs_stream(
             reason = "STREAM INVALID MOVEMENT TIME"
         elif float(difference) <= time_tolerance_minutes:
             status = "MATCHED"
-            reason = "VALID STREAM MATCH"
+            reason = {
+                "RECOVERED DATE MATCH": "VALID STREAM MATCH BY RECOVERED DATE",
+                "ACTUAL MOVEMENT DATE MATCH": (
+                    "VALID STREAM MATCH BY ACTUAL MOVEMENT DATE"
+                ),
+            }.get(str(selected["match_mode"]), "VALID STREAM MATCH")
         elif float(difference) <= 120:
             status = "NEED REVIEW"
             reason = "STREAM TIME DIFFERENCE"
@@ -1109,6 +1223,8 @@ def reconcile_dat_vs_stream(
                 "SELECTED DAT RECORD": False,
                 "STREAM MATCH KEY": "",
                 "STREAM VALIDATION RESULT": "NOT APPLICABLE",
+                "STREAM MATCH DATE USED": "",
+                "STREAM MATCH MODE": "NO STREAM MATCH",
                 "BILLING CATEGORY": "BILLING REVIEW",
                 "COMPLETENESS_SCORE": duplicate_row.get("COMPLETENESS_SCORE", ""),
                 "HAS_MOVEMENT_TIME": duplicate_row.get("HAS_MOVEMENT_TIME", ""),

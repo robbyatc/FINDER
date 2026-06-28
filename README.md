@@ -19,6 +19,7 @@ Buka FINDER dari komputer, tablet, atau ponsel melalui:
 - Hasil: Missing in Stream, Matched, Need Review, Extra in Stream, dan Duplicate DAT.
 - Hard exclude Non-Billable/Internal Movement sebelum recovery, deduplikasi, dan reconciliation.
 - Adjacent Date / Midnight Recovery dari RAW DAT yang sudah dinormalisasi.
+- Fallback STREAM matching melalui original date, recovered date, lalu actual movement date.
 - Deduplikasi per flight instance agar pergerakan berbeda tidak saling menimpa.
 - Audit reason untuk setiap hasil dan candidate STREAM.
 - Kolom Actual Movement Date dari ATA untuk arrival atau ATD untuk departure, tanpa mengubah EOBD sebagai base key.
