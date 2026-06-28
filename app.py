@@ -29,6 +29,20 @@ st.set_page_config(
 )
 
 
+# Clear reconciliation output created with an older result schema. Without this,
+# a long-lived Streamlit session can keep displaying a cached table that predates
+# newly added result columns even after the application has been redeployed.
+RESULT_SCHEMA_VERSION = "2026-06-28-actual-movement-date-v1"
+if st.session_state.get("finder_result_schema_version") != RESULT_SCHEMA_VERSION:
+    for stale_key in (
+        "finder_results",
+        "finder_report",
+        "finder_result_signature",
+    ):
+        st.session_state.pop(stale_key, None)
+    st.session_state["finder_result_schema_version"] = RESULT_SCHEMA_VERSION
+
+
 st.markdown(
     """
     <style>
