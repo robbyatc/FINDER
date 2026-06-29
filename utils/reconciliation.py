@@ -790,6 +790,7 @@ def _candidate_evaluation(
     stream_row: pd.Series,
     invalid_statuses: set[str],
     treat_invalid_status_as_missing: bool,
+    time_tolerance_minutes: int,
     match_date_used: str,
     match_mode: str,
 ) -> dict[str, object]:
@@ -806,11 +807,24 @@ def _candidate_evaluation(
     )
     time_difference: float | None = None
     date_mismatch = False
+    allowed_movement_dates: set[str] = set()
+    if dat_datetime is not None:
+        allowed_movement_dates.add(dat_datetime.strftime("%Y-%m-%d"))
+    if bool(dat_row.get("DAT_RECOVERY_USED", False)):
+        for allowed_date in (
+            dat_row.get("ACTUAL MOVEMENT DATE", ""),
+            dat_row.get("RECOVERED_DAT_DATE", ""),
+        ):
+            normalized_allowed_date = normalize_date(allowed_date)
+            if normalized_allowed_date:
+                allowed_movement_dates.add(normalized_allowed_date)
     if dat_datetime is not None and stream_datetime is not None:
         time_difference = abs(
             (stream_datetime - dat_datetime).total_seconds() / 60.0
         )
-        date_mismatch = dat_datetime.date() != stream_datetime.date()
+        date_mismatch = (
+            stream_datetime.strftime("%Y-%m-%d") not in allowed_movement_dates
+        )
 
     movement_field = "ATA" if dat_row["D/A/L/O"] == "A" else "ATD"
     invalid_reasons: list[str] = []
@@ -822,8 +836,6 @@ def _candidate_evaluation(
         invalid_reasons.append("STREAM INVALID MOVEMENT TIME")
     if date_mismatch:
         invalid_reasons.append(f"STREAM INVALID {movement_field} DATE")
-    if register_mismatch:
-        invalid_reasons.append("STREAM AC REGISTER MISMATCH")
 
     priority_timestamp = parse_priority_timestamp(stream_row["TIMESTAMP"])
     priority_value = (
@@ -833,8 +845,19 @@ def _candidate_evaluation(
         1 if invalid_status else 0,
         1 if stream_datetime is None else 0,
         1 if date_mismatch else 0,
+        (
+            1
+            if time_difference is None
+            or time_difference > time_tolerance_minutes
+            else 0
+        ),
         1 if register_mismatch else 0,
         time_difference if time_difference is not None else float("inf"),
+        {
+            "ORIGINAL DATE MATCH": 0,
+            "RECOVERED DATE MATCH": 1,
+            "ACTUAL MOVEMENT DATE MATCH": 2,
+        }.get(match_mode, 3),
         priority_value,
         -parse_message_number(stream_row["MESSAGE NUM"]),
         -int(stream_row["SOURCE ROW"]),
@@ -847,6 +870,13 @@ def _candidate_evaluation(
     }.get(match_mode, "VALID STREAM CANDIDATE")
     if invalid_reasons:
         validation_result = " / ".join(invalid_reasons)
+    if register_mismatch:
+        register_note = "STREAM AC REGISTER MISMATCH"
+        validation_result = (
+            f"{validation_result} / {register_note}"
+            if validation_result
+            else register_note
+        )
     return {
         "stream_row": stream_row,
         "stream_status": stream_status,
@@ -854,6 +884,7 @@ def _candidate_evaluation(
         "stream_datetime": stream_datetime,
         "time_difference": time_difference,
         "date_mismatch": date_mismatch,
+        "allowed_movement_dates": sorted(allowed_movement_dates),
         "register_mismatch": register_mismatch,
         "invalid_reasons": invalid_reasons,
         "validation_result": validation_result,
@@ -1109,15 +1140,23 @@ def reconcile_dat_vs_stream(
 
     for _, dat_row in dat_unique.iterrows():
         search_specs = _stream_search_specs(dat_row)
-        selected_search_spec: dict[str, str] | None = None
-        candidates: pd.DataFrame | None = None
+        evaluations: list[dict[str, object]] = []
         for search_spec in search_specs:
             candidate_group = stream_groups.get(search_spec["key"])
             if candidate_group is not None and not candidate_group.empty:
-                selected_search_spec = search_spec
-                candidates = candidate_group
-                break
-        if candidates is None or candidates.empty:
+                evaluations.extend(
+                    _candidate_evaluation(
+                        dat_row,
+                        stream_row,
+                        invalid_statuses,
+                        treat_invalid_stream_status_as_missing,
+                        time_tolerance_minutes,
+                        search_spec["date_used"],
+                        search_spec["mode"],
+                    )
+                    for _, stream_row in candidate_group.iterrows()
+                )
+        if not evaluations:
             not_found_reason = (
                 "STREAM NOT FOUND AFTER ORIGINAL AND RECOVERED DATE SEARCH"
                 if bool(dat_row.get("DAT_RECOVERY_USED", False))
@@ -1130,22 +1169,10 @@ def reconcile_dat_vs_stream(
             audit_records.append(result.copy())
             continue
 
-        assert selected_search_spec is not None
-
-        evaluations = [
-            _candidate_evaluation(
-                dat_row,
-                stream_row,
-                invalid_statuses,
-                treat_invalid_stream_status_as_missing,
-                selected_search_spec["date_used"],
-                selected_search_spec["mode"],
-            )
-            for _, stream_row in candidates.iterrows()
-        ]
         selected = min(evaluations, key=lambda item: item["selection_sort"])
         invalid_reasons = list(selected["invalid_reasons"])
         difference = selected["time_difference"]
+        register_mismatch = bool(selected["register_mismatch"])
         if invalid_reasons:
             status = "MISSING IN STREAM"
             reason = " / ".join(invalid_reasons)
@@ -1153,16 +1180,24 @@ def reconcile_dat_vs_stream(
             status = "MISSING IN STREAM"
             reason = "STREAM INVALID MOVEMENT TIME"
         elif float(difference) <= time_tolerance_minutes:
-            status = "MATCHED"
-            reason = {
-                "RECOVERED DATE MATCH": "VALID STREAM MATCH BY RECOVERED DATE",
-                "ACTUAL MOVEMENT DATE MATCH": (
-                    "VALID STREAM MATCH BY ACTUAL MOVEMENT DATE"
-                ),
-            }.get(str(selected["match_mode"]), "VALID STREAM MATCH")
+            if register_mismatch:
+                status = "NEED REVIEW"
+                reason = "STREAM AC REGISTER MISMATCH"
+            else:
+                status = "MATCHED"
+                reason = {
+                    "RECOVERED DATE MATCH": "VALID STREAM MATCH BY RECOVERED DATE",
+                    "ACTUAL MOVEMENT DATE MATCH": (
+                        "VALID STREAM MATCH BY ACTUAL MOVEMENT DATE"
+                    ),
+                }.get(str(selected["match_mode"]), "VALID STREAM MATCH")
         elif float(difference) <= 120:
             status = "NEED REVIEW"
-            reason = "STREAM TIME DIFFERENCE"
+            reason = (
+                "STREAM TIME DIFFERENCE / STREAM AC REGISTER MISMATCH"
+                if register_mismatch
+                else "STREAM TIME DIFFERENCE"
+            )
         else:
             status = "MISSING IN STREAM"
             reason = "STREAM TIME MISMATCH"

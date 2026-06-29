@@ -415,14 +415,14 @@ class ReconciliationTests(unittest.TestCase):
         )
         stream = pd.DataFrame(
             {
-                "DATE OF FLIGHT": ["2026-06-24"],
-                "FLIGHT NUMBER": ["CTV010"],
-                "AERODROME": ["WIHH"],
-                "TO FROM": ["WIMM"],
-                "AC REGISTER": ["PKGLM"],
-                "D/A/L/O": ["A"],
-                "ATA": ["2026-06-24 02:52"],
-                "STATUS FLIGHT": ["REGULER"],
+                "DATE OF FLIGHT": ["2026-06-23", "2026-06-24"],
+                "FLIGHT NUMBER": ["CTV010", "CTV010"],
+                "AERODROME": ["WIHH", "WIHH"],
+                "TO FROM": ["WIMM", "WIMM"],
+                "AC REGISTER": ["PKGLM", "PKGLM"],
+                "D/A/L/O": ["A", "A"],
+                "ATA": ["2026-06-23 02:52", "2026-06-24 02:52"],
+                "STATUS FLIGHT": ["REGULER", "REGULER"],
             }
         )
 
@@ -443,6 +443,102 @@ class ReconciliationTests(unittest.TestCase):
         self.assertEqual(matched["STREAM MOVEMENT DATETIME"], "2026-06-24 02:52")
         self.assertEqual(float(matched["TIME DIFFERENCE MINUTES"]), 0.0)
         self.assertTrue(bool(matched["DAT_RECOVERY_USED"]))
+
+    def test_recovered_movement_date_is_valid_on_original_stream_key(self):
+        dep = pd.DataFrame(columns=["callsign", "adep", "ades", "eobd"])
+        arr = pd.DataFrame(
+            {
+                "callsign": ["CTV012", "CTV012"],
+                "adep": ["WIHH", "WIHH"],
+                "ades": ["WIMM", "WIMM"],
+                "eobd": ["260623", "260624"],
+                "eobt": ["2340", "0045"],
+                "atd": ["", "2026-06-24 00:54"],
+                "ata": ["", "2026-06-24 02:52"],
+                "register": ["PKGLM", "PKGLM"],
+            }
+        )
+        stream = pd.DataFrame(
+            {
+                "DATE OF FLIGHT": ["2026-06-23"],
+                "FLIGHT NUMBER": ["CTV012"],
+                "AERODROME": ["WIHH"],
+                "TO FROM": ["WIMM"],
+                "AC REGISTER": ["PKGLM"],
+                "D/A/L/O": ["A"],
+                "ATA": ["2026-06-24 02:52"],
+                "STATUS FLIGHT": ["REGULER"],
+            }
+        )
+        result = reconcile_dat_vs_stream(dep, arr, stream)
+        matched = result["matched"].iloc[0]
+        self.assertEqual(matched["MATCH_REASON"], "VALID STREAM MATCH")
+        self.assertEqual(matched["STREAM MATCH MODE"], "ORIGINAL DATE MATCH")
+        self.assertEqual(float(matched["TIME DIFFERENCE MINUTES"]), 0.0)
+
+    def test_recovered_time_match_with_register_mismatch_needs_review(self):
+        dep = pd.DataFrame(columns=["callsign", "adep", "ades", "eobd"])
+        arr = pd.DataFrame(
+            {
+                "callsign": ["CTV013", "CTV013"],
+                "adep": ["WIHH", "WIHH"],
+                "ades": ["WIMM", "WIMM"],
+                "eobd": ["260623", "260624"],
+                "eobt": ["2340", "0045"],
+                "atd": ["", "2026-06-24 00:54"],
+                "ata": ["", "2026-06-24 02:52"],
+                "register": ["PKGLM", "PKGLM"],
+            }
+        )
+        stream = pd.DataFrame(
+            {
+                "DATE OF FLIGHT": ["2026-06-24"],
+                "FLIGHT NUMBER": ["CTV013"],
+                "AERODROME": ["WIHH"],
+                "TO FROM": ["WIMM"],
+                "AC REGISTER": ["PKXXX"],
+                "D/A/L/O": ["A"],
+                "ATA": ["2026-06-24 02:52"],
+                "STATUS FLIGHT": ["REGULER"],
+            }
+        )
+        result = reconcile_dat_vs_stream(dep, arr, stream)
+        self.assertTrue(result["missing"].empty)
+        self.assertTrue(result["matched"].empty)
+        reviewed = result["need_review"].iloc[0]
+        self.assertEqual(reviewed["MATCH_REASON"], "STREAM AC REGISTER MISMATCH")
+        self.assertEqual(reviewed["STREAM MATCH MODE"], "RECOVERED DATE MATCH")
+        self.assertEqual(float(reviewed["TIME DIFFERENCE MINUTES"]), 0.0)
+
+    def test_exact_register_within_tolerance_beats_closer_mismatch(self):
+        dep = pd.DataFrame(
+            {
+                "callsign": ["REG001"],
+                "adep": ["WIMM"],
+                "ades": ["WIII"],
+                "eobd": ["260623"],
+                "atd": ["10:00"],
+                "register": ["PKAAA"],
+            }
+        )
+        arr = pd.DataFrame(columns=["callsign", "adep", "ades", "eobd"])
+        stream = pd.DataFrame(
+            {
+                "DATE OF FLIGHT": ["2026-06-23", "2026-06-23"],
+                "FLIGHT NUMBER": ["REG001", "REG001"],
+                "AERODROME": ["WIMM", "WIMM"],
+                "TO FROM": ["WIII", "WIII"],
+                "AC REGISTER": ["PKXXX", "PKAAA"],
+                "D/A/L/O": ["D", "D"],
+                "ATD": ["2026-06-23 10:00", "2026-06-23 10:01"],
+                "STATUS FLIGHT": ["REGULER", "REGULER"],
+            }
+        )
+        result = reconcile_dat_vs_stream(dep, arr, stream)
+        matched = result["matched"].iloc[0]
+        self.assertEqual(matched["MATCH_REASON"], "VALID STREAM MATCH")
+        self.assertEqual(float(matched["TIME DIFFERENCE MINUTES"]), 1.0)
+        self.assertEqual(int(matched["STREAM SOURCE ROW"]), 3)
 
     def test_actual_date_creates_distinct_flight_instances(self):
         dep = pd.DataFrame(columns=["callsign", "adep", "ades", "eobd"])

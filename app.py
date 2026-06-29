@@ -32,7 +32,7 @@ st.set_page_config(
 # Clear reconciliation output created with an older result schema. Without this,
 # a long-lived Streamlit session can keep displaying a cached table that predates
 # newly added result columns even after the application has been redeployed.
-RESULT_SCHEMA_VERSION = "2026-06-28-recovered-stream-match-v3"
+RESULT_SCHEMA_VERSION = "2026-06-29-recovered-date-validation-v4"
 if st.session_state.get("finder_result_schema_version") != RESULT_SCHEMA_VERSION:
     for stale_key in (
         "finder_results",
@@ -482,7 +482,7 @@ def render_summary_dashboard(results: dict[str, object]) -> None:
     with row_two[0]:
         metric_card("Missing in Stream", f"{summary['missing_in_stream']:,}", "#e84c3d", "Potential unbilled flights", True)
     with row_two[1]:
-        metric_card("Need Review", f"{summary['need_review']:,}", "#f28b30", "Time difference ≤ 120 min")
+        metric_card("Need Review", f"{summary['need_review']:,}", "#f28b30", "Time or register validation")
     with row_two[2]:
         metric_card("Extra in Stream", f"{summary['extra_in_stream']:,}", "#7567c7", "Not found in DAT")
     with row_two[3]:
@@ -675,7 +675,7 @@ def render_results_page(results: dict[str, object]) -> None:
         result_table(results["matched"])
     with tabs[2]:
         st.warning(
-            "NEED REVIEW — STREAM valid, tetapi selisih waktu melebihi tolerance dan tidak lebih dari 120 menit."
+            "NEED REVIEW — STREAM valid, tetapi selisih waktu melebihi tolerance atau AC REGISTER berbeda."
         )
         result_table(results["need_review"])
     with tabs[3]:
