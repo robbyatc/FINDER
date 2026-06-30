@@ -6,10 +6,23 @@ from typing import Mapping
 
 import pandas as pd
 
-from utils.reconciliation import RECOVERY_AUDIT_COLUMNS, RESULT_COLUMNS
+from utils.reconciliation import (
+    DISPLAY_RESULT_COLUMNS,
+    RECOVERY_AUDIT_COLUMNS,
+)
 
 
-MISSING_EXPORT_COLUMNS = RESULT_COLUMNS + [
+MISSING_EXPORT_COLUMNS = DISPLAY_RESULT_COLUMNS + [
+    "STATUS",
+    "MATCH_REASON",
+    "STREAM STATUS FLIGHT",
+    "DAT MOVEMENT DATETIME",
+    "STREAM MOVEMENT DATETIME",
+    "TIME DIFFERENCE MINUTES",
+] + RECOVERY_AUDIT_COLUMNS
+
+VALIDATION_EXPORT_COLUMNS = DISPLAY_RESULT_COLUMNS + [
+    "STATUS",
     "MATCH_REASON",
     "STREAM STATUS FLIGHT",
     "DAT MOVEMENT DATETIME",
@@ -29,7 +42,7 @@ def _select_columns(frame: pd.DataFrame, requested: list[str] | None) -> pd.Data
 
 
 def build_excel_report(results: Mapping[str, object]) -> bytes:
-    """Create the eight-sheet FINDER audit workbook."""
+    """Create the nine-sheet FINDER audit workbook."""
     from openpyxl import Workbook
     from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
     from openpyxl.utils import get_column_letter
@@ -40,6 +53,7 @@ def build_excel_report(results: Mapping[str, object]) -> bytes:
     white = "FFFFFF"
     border_color = "D7DFEC"
     sheet_colors = {
+        "Validasi": "C0392B",
         "Missing in Stream": "E84C3D",
         "Matched": "1F9D68",
         "Need Review": "F28B30",
@@ -88,7 +102,15 @@ def build_excel_report(results: Mapping[str, object]) -> bytes:
                 summary_sheet.cell(row_index, column).font = Font(
                     color="B42318", bold=True
                 )
-        elif row.METRIC == "Need Review":
+        elif row.METRIC == "Total Validasi":
+            for column in (1, 2):
+                summary_sheet.cell(row_index, column).fill = PatternFill(
+                    "solid", fgColor="FDE9E7"
+                )
+                summary_sheet.cell(row_index, column).font = Font(
+                    color="B42318", bold=True
+                )
+        elif row.METRIC in {"Need Review", "Total Perlu Review STREAM"}:
             for column in (1, 2):
                 summary_sheet.cell(row_index, column).fill = PatternFill(
                     "solid", fgColor="FFF1E5"
@@ -105,6 +127,7 @@ def build_excel_report(results: Mapping[str, object]) -> bytes:
     summary_sheet.freeze_panes = "A5"
 
     sheet_specs = [
+        ("Validasi", "validasi", VALIDATION_EXPORT_COLUMNS),
         ("Missing in Stream", "missing", MISSING_EXPORT_COLUMNS),
         ("Matched", "matched", None),
         ("Need Review", "need_review", None),

@@ -10,9 +10,8 @@ import streamlit as st
 from comparison import OUTPUT_LABELS
 from reconciliation import (
     AUDIT_COLUMNS,
-    DETAIL_COLUMNS,
+    DISPLAY_RESULT_COLUMNS,
     DUPLICATE_AUDIT_COLUMNS,
-    RESULT_COLUMNS,
     build_excel_report,
     detected_mapping,
     read_uploaded_table,
@@ -32,7 +31,7 @@ st.set_page_config(
 # Clear reconciliation output created with an older result schema. Without this,
 # a long-lived Streamlit session can keep displaying a cached table that predates
 # newly added result columns even after the application has been redeployed.
-RESULT_SCHEMA_VERSION = "2026-06-29-recovered-date-validation-v4"
+RESULT_SCHEMA_VERSION = "2026-06-30-actual-movement-validation-v5"
 if st.session_state.get("finder_result_schema_version") != RESULT_SCHEMA_VERSION:
     for stale_key in (
         "finder_results",
@@ -491,6 +490,31 @@ def render_summary_dashboard(results: dict[str, object]) -> None:
         metric_card("Accuracy Percentage", f"{summary['accuracy_percentage']:.1f}%", "#13a8bd", "Matched ÷ unique DAT")
 
     st.write("")
+    validation_cols = st.columns(3)
+    with validation_cols[0]:
+        metric_card(
+            "Total Ada di STREAM",
+            f"{summary['total_ada_di_stream']:,}",
+            "#1f9d68",
+            "Actual movement matched",
+        )
+    with validation_cols[1]:
+        metric_card(
+            "Total Validasi",
+            f"{summary['total_validasi']:,}",
+            "#e84c3d",
+            "DAT without any STREAM candidate",
+            True,
+        )
+    with validation_cols[2]:
+        metric_card(
+            "Total Perlu Review STREAM",
+            f"{summary['total_perlu_review_stream']:,}",
+            "#f28b30",
+            "Candidate found with discrepancy",
+        )
+
+    st.write("")
     exclusion_cols = st.columns([1, 1, 3])
     with exclusion_cols[0]:
         metric_card(
@@ -570,7 +594,9 @@ def result_table(
     extra_default_columns: list[str] | None = None,
 ) -> None:
     settings = reconciliation_settings()
-    columns = [column for column in RESULT_COLUMNS if column in frame.columns]
+    columns = [
+        column for column in DISPLAY_RESULT_COLUMNS if column in frame.columns
+    ]
     if extra_default_columns:
         columns.extend(
             column
@@ -594,6 +620,7 @@ def result_table(
                 "ACTUAL MOVEMENT DATE", format="YYYY-MM-DD"
             ),
             "STATUS": st.column_config.TextColumn("STATUS", width="medium"),
+            "VALIDASI": st.column_config.TextColumn("VALIDASI", width="large"),
         },
     )
 
@@ -644,6 +671,7 @@ def render_results_page(results: dict[str, object]) -> None:
     summary = results["summary"]
     tabs = st.tabs(
         [
+            f"🔎 Validasi ({summary['total_validasi']:,})",
             f"🚨 Missing — Billing Review ({summary['missing_billing_review']:,})",
             f"✅ Matched ({summary['matched']:,})",
             f"🟠 Need Review ({summary['need_review']:,})",
@@ -653,6 +681,17 @@ def render_results_page(results: dict[str, object]) -> None:
         ]
     )
     with tabs[0]:
+        st.error(
+            "VALIDASI — Hanya data DAT yang tidak memiliki kandidat STREAM setelah pencarian actual movement, original date, dan recovered date."
+        )
+        validated_missing = filtered_missing_table(
+            results["validasi"], key_prefix="validasi"
+        )
+        st.caption(
+            f"Showing {len(validated_missing):,} of {len(results['validasi']):,} validation records"
+        )
+        result_table(validated_missing)
+    with tabs[1]:
         st.markdown(
             """
             <div class="result-banner">
@@ -670,23 +709,23 @@ def render_results_page(results: dict[str, object]) -> None:
             f"Showing {len(filtered):,} of {len(results['missing']):,} total missing records"
         )
         result_table(filtered)
-    with tabs[1]:
+    with tabs[2]:
         st.success("MATCHED — Data DAT berhasil ditemukan di STREAM.")
         result_table(results["matched"])
-    with tabs[2]:
+    with tabs[3]:
         st.warning(
             "NEED REVIEW — STREAM valid, tetapi selisih waktu melebihi tolerance atau AC REGISTER berbeda."
         )
         result_table(results["need_review"])
-    with tabs[3]:
+    with tabs[4]:
         st.info("EXTRA IN STREAM — Data STREAM tidak memiliki pasangan di DAT DEP/ARR.")
         result_table(results["extra"])
-    with tabs[4]:
+    with tabs[5]:
         st.warning(
             "DUPLICATE DAT — Hanya record yang tidak terpilih. Record terbaik tetap menjadi DAT Unique dan dipakai untuk reconciliation."
         )
         result_table(results["duplicates"], extra_default_columns=DUPLICATE_AUDIT_COLUMNS)
-    with tabs[5]:
+    with tabs[6]:
         st.dataframe(results["summary_table"], width="stretch", hide_index=True)
         if summary["incomplete_dat_keys"] or summary["incomplete_stream_keys"]:
             st.warning(
@@ -698,7 +737,7 @@ def render_results_page(results: dict[str, object]) -> None:
     section_heading(
         "EXPORT",
         "Export reconciliation report",
-        "Workbook berisi hasil utama, audit recovery, dan sheet Excluded Non-Billable.",
+        "Workbook berisi sheet Validasi, hasil utama, audit recovery, dan Excluded Non-Billable.",
     )
     download_left, download_right = st.columns([1.2, 2])
     with download_left:
@@ -813,7 +852,7 @@ def render_export_page(results: dict[str, object] | None) -> None:
     summary = results["summary"]
     cols = st.columns(3)
     with cols[0]:
-        metric_card("Report Status", "READY", "#1f9d68", "Eight worksheets generated")
+        metric_card("Report Status", "READY", "#1f9d68", "Nine worksheets generated")
     with cols[1]:
         metric_card("Missing Records", f"{summary['missing_in_stream']:,}", "#e84c3d", "Priority billing review", True)
     with cols[2]:
@@ -824,6 +863,7 @@ def render_export_page(results: dict[str, object] | None) -> None:
         st.markdown(
             """
             - **Summary** — reconciliation metrics and accuracy
+            - **Validasi** — hanya DAT yang tidak ditemukan sama sekali di STREAM
             - **Missing in Stream** — potential unbilled flights
             - **Matched** — validated DAT records
             - **Need Review** — valid STREAM with time difference above tolerance
@@ -858,7 +898,7 @@ def render_about_page() -> None:
         with st.container(border=True):
             st.markdown("#### 🎯 Matching logic")
             st.markdown(
-                "Record dicocokkan menggunakan **Date of Flight + Flight Number + ADEP/Aerodrome + ADES/TO FROM + Movement Type**."
+                "Record diprioritaskan berdasarkan **tanggal/waktu actual movement ATD/ATA + Flight Number + ADEP/Aerodrome + ADES/TO FROM + Movement Type**. Date of Flight dan recovered date digunakan sebagai fallback."
             )
     with about_right:
         with st.container(border=True):

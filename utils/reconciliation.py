@@ -48,6 +48,16 @@ RESULT_COLUMNS = [
     "ARRIVAL RUNWAY",
 ]
 
+VALIDATION_FOUND = "ADA DI STREAM"
+VALIDATION_NOT_FOUND = "ADA DI DAT TIDAK ADA DI STREAM"
+VALIDATION_REVIEW = "PERLU REVIEW STREAM"
+VALIDATION_VALUES = (
+    VALIDATION_FOUND,
+    VALIDATION_NOT_FOUND,
+    VALIDATION_REVIEW,
+)
+DISPLAY_RESULT_COLUMNS = RESULT_COLUMNS + ["VALIDASI"]
+
 AUDIT_COLUMNS = [
     "SOURCE DATA",
     "SOURCE ROW",
@@ -75,7 +85,7 @@ AUDIT_COLUMNS = [
     "MOVEMENT_TIME_BUCKET",
 ]
 
-DETAIL_COLUMNS = RESULT_COLUMNS + AUDIT_COLUMNS
+DETAIL_COLUMNS = DISPLAY_RESULT_COLUMNS + AUDIT_COLUMNS
 
 DUPLICATE_AUDIT_COLUMNS = [
     "DUPLICATE_GROUP_KEY",
@@ -481,6 +491,8 @@ def _prepare_keys(frame: pd.DataFrame, side: str) -> pd.DataFrame:
     prepared["__complete_key"] = prepared[key_columns].ne("").all(axis=1)
     if prepared.empty:
         prepared["__match_key"] = pd.Series(dtype=object)
+        prepared["__movement_match_key"] = pd.Series(dtype=object)
+        prepared["__complete_movement_key"] = pd.Series(dtype=bool)
         prepared["DUPLICATE_GROUP_KEY"] = pd.Series(dtype=object)
         return prepared
     prepared["__match_key"] = prepared[key_columns].astype(str).agg("␟".join, axis=1)
@@ -490,6 +502,35 @@ def _prepare_keys(frame: pd.DataFrame, side: str) -> pd.DataFrame:
     incomplete = ~prepared["__complete_key"]
     prepared.loc[incomplete, "__match_key"] = prepared.loc[incomplete].apply(
         lambda row: f"__INCOMPLETE__{side}__{row['SOURCE DATA']}__{row['SOURCE ROW']}",
+        axis=1,
+    )
+    movement_dates = prepared["MOVEMENT_DATETIME"].map(
+        lambda value: (
+            pd.Timestamp(value).strftime("%Y-%m-%d")
+            if _timestamp(value) is not None
+            else ""
+        )
+    )
+    movement_key_columns = [
+        movement_dates.rename("__movement_date"),
+        prepared["__key_flight"],
+        prepared["__key_adep"],
+        prepared["__key_ades"],
+        prepared["__key_movement"],
+    ]
+    movement_key_frame = pd.concat(movement_key_columns, axis=1)
+    prepared["__complete_movement_key"] = movement_key_frame.ne("").all(axis=1)
+    prepared["__movement_match_key"] = movement_key_frame.astype(str).agg(
+        "␟".join, axis=1
+    )
+    incomplete_movement = ~prepared["__complete_movement_key"]
+    prepared.loc[incomplete_movement, "__movement_match_key"] = prepared.loc[
+        incomplete_movement
+    ].apply(
+        lambda row: (
+            f"__INCOMPLETE_MOVEMENT__{side}__"
+            f"{row['SOURCE DATA']}__{row['SOURCE ROW']}"
+        ),
         axis=1,
     )
     return prepared
@@ -743,12 +784,19 @@ def _match_key_for_date(row: pd.Series, match_date: object) -> str | None:
 
 
 def _stream_search_specs(dat_row: pd.Series) -> list[dict[str, str]]:
-    """Return ordered original, recovered, then actual-date STREAM lookup keys."""
+    """Return actual-movement lookup first, followed by date fallbacks."""
     requested = [
+        (
+            dat_row.get("ACTUAL MOVEMENT DATE", ""),
+            "ACTUAL MOVEMENT DATE",
+            "ACTUAL MOVEMENT DATE MATCH",
+            "MOVEMENT DATE",
+        ),
         (
             dat_row.get("DATE OF FLIGHT", ""),
             "DATE OF FLIGHT",
             "ORIGINAL DATE MATCH",
+            "DATE OF FLIGHT",
         )
     ]
     if bool(dat_row.get("DAT_RECOVERY_USED", False)):
@@ -757,29 +805,25 @@ def _stream_search_specs(dat_row: pd.Series) -> list[dict[str, str]]:
                 dat_row.get("RECOVERED_DAT_DATE", ""),
                 "RECOVERED_DAT_DATE",
                 "RECOVERED DATE MATCH",
+                "DATE OF FLIGHT",
             )
         )
-    requested.append(
-        (
-            dat_row.get("ACTUAL MOVEMENT DATE", ""),
-            "ACTUAL MOVEMENT DATE",
-            "ACTUAL MOVEMENT DATE MATCH",
-        )
-    )
 
     specs: list[dict[str, str]] = []
-    seen_keys: set[str] = set()
-    for match_date, date_used, mode in requested:
+    seen_lookups: set[tuple[str, str]] = set()
+    for match_date, date_used, mode, lookup_index in requested:
         key = _match_key_for_date(dat_row, match_date)
-        if key is None or key in seen_keys:
+        lookup_token = (lookup_index, key or "")
+        if key is None or lookup_token in seen_lookups:
             continue
-        seen_keys.add(key)
+        seen_lookups.add(lookup_token)
         specs.append(
             {
                 "key": key,
                 "date_used": date_used,
                 "mode": mode,
                 "date_value": normalize_date(match_date),
+                "lookup_index": lookup_index,
             }
         )
     return specs
@@ -854,9 +898,9 @@ def _candidate_evaluation(
         1 if register_mismatch else 0,
         time_difference if time_difference is not None else float("inf"),
         {
-            "ORIGINAL DATE MATCH": 0,
+            "ACTUAL MOVEMENT DATE MATCH": 0,
             "RECOVERED DATE MATCH": 1,
-            "ACTUAL MOVEMENT DATE MATCH": 2,
+            "ORIGINAL DATE MATCH": 2,
         }.get(match_mode, 3),
         priority_value,
         -parse_message_number(stream_row["MESSAGE NUM"]),
@@ -899,6 +943,7 @@ def _result_from_dat(
     status: str,
     reason: str,
     selected_evaluation: Mapping[str, object] | None,
+    validasi: str | None = None,
 ) -> dict[str, object]:
     result = {column: dat_row.get(column, "") for column in RESULT_COLUMNS}
     stream_row = (
@@ -926,8 +971,16 @@ def _result_from_dat(
         if selected_evaluation
         else "NO STREAM MATCH"
     )
+    if validasi is None:
+        if selected_evaluation is None:
+            validasi = VALIDATION_NOT_FOUND
+        elif status == "MATCHED":
+            validasi = VALIDATION_FOUND
+        else:
+            validasi = VALIDATION_REVIEW
     result.update(
         {
+            "VALIDASI": validasi,
             "SOURCE DATA": dat_row["SOURCE DATA"],
             "SOURCE ROW": int(dat_row["SOURCE ROW"]),
             "STATUS": status,
@@ -973,6 +1026,7 @@ def _result_from_stream(stream_row: pd.Series) -> dict[str, object]:
     result = {column: stream_row.get(column, "") for column in RESULT_COLUMNS}
     result.update(
         {
+            "VALIDASI": "",
             "SOURCE DATA": "STREAM",
             "SOURCE ROW": int(stream_row["SOURCE ROW"]),
             "STATUS": "EXTRA IN STREAM",
@@ -1121,31 +1175,38 @@ def reconcile_dat_vs_stream(
     dat_unique, duplicate_raw = deduplicate_dat(dat_prepared)
     duplicate_dat = _duplicate_output(duplicate_raw)
 
-    stream_groups = {
+    stream_groups_by_flight_date = {
         str(key): group.copy()
         for key, group in stream_prepared.loc[
             stream_prepared["__complete_key"]
         ].groupby("__match_key", sort=False)
     }
-    dat_keys: set[str] = set()
-    for _, keyed_dat_row in dat_unique.loc[dat_unique["__complete_key"]].iterrows():
-        dat_keys.update(
-            spec["key"] for spec in _stream_search_specs(keyed_dat_row)
-        )
+    stream_groups_by_movement_date = {
+        str(key): group.copy()
+        for key, group in stream_prepared.loc[
+            stream_prepared["__complete_movement_key"]
+        ].groupby("__movement_match_key", sort=False)
+    }
 
     matched_records: list[dict[str, object]] = []
     missing_records: list[dict[str, object]] = []
     need_review_records: list[dict[str, object]] = []
     audit_records: list[dict[str, object]] = []
+    candidate_stream_source_rows: set[int] = set()
 
     for _, dat_row in dat_unique.iterrows():
         search_specs = _stream_search_specs(dat_row)
-        evaluations: list[dict[str, object]] = []
+        evaluations_by_source_row: dict[int, dict[str, object]] = {}
         for search_spec in search_specs:
-            candidate_group = stream_groups.get(search_spec["key"])
+            candidate_groups = (
+                stream_groups_by_movement_date
+                if search_spec["lookup_index"] == "MOVEMENT DATE"
+                else stream_groups_by_flight_date
+            )
+            candidate_group = candidate_groups.get(search_spec["key"])
             if candidate_group is not None and not candidate_group.empty:
-                evaluations.extend(
-                    _candidate_evaluation(
+                for _, stream_row in candidate_group.iterrows():
+                    evaluation = _candidate_evaluation(
                         dat_row,
                         stream_row,
                         invalid_statuses,
@@ -1154,13 +1215,20 @@ def reconcile_dat_vs_stream(
                         search_spec["date_used"],
                         search_spec["mode"],
                     )
-                    for _, stream_row in candidate_group.iterrows()
-                )
+                    source_row = int(stream_row["SOURCE ROW"])
+                    candidate_stream_source_rows.add(source_row)
+                    existing = evaluations_by_source_row.get(source_row)
+                    if (
+                        existing is None
+                        or evaluation["selection_sort"] < existing["selection_sort"]
+                    ):
+                        evaluations_by_source_row[source_row] = evaluation
+        evaluations = list(evaluations_by_source_row.values())
         if not evaluations:
             not_found_reason = (
-                "STREAM NOT FOUND AFTER ORIGINAL AND RECOVERED DATE SEARCH"
+                "STREAM NOT FOUND AFTER ACTUAL MOVEMENT, ORIGINAL, AND RECOVERED DATE SEARCH"
                 if bool(dat_row.get("DAT_RECOVERY_USED", False))
-                else "STREAM NOT FOUND"
+                else "STREAM NOT FOUND AFTER ACTUAL MOVEMENT AND ORIGINAL DATE SEARCH"
             )
             result = _result_from_dat(
                 dat_row, "MISSING IN STREAM", not_found_reason, None
@@ -1219,6 +1287,7 @@ def reconcile_dat_vs_stream(
                 "STREAM CANDIDATE NOT SELECTED",
                 "LOWER PRIORITY STREAM CANDIDATE",
                 evaluation,
+                validasi=str(result["VALIDASI"]),
             )
             audit_row["STREAM VALIDATION RESULT"] = (
                 "NOT SELECTED / " + str(evaluation["validation_result"])
@@ -1230,8 +1299,7 @@ def reconcile_dat_vs_stream(
     need_review = _records_frame(need_review_records)
 
     extra_rows = stream_prepared.loc[
-        (~stream_prepared["__complete_key"])
-        | (~stream_prepared["__match_key"].isin(dat_keys))
+        ~stream_prepared["SOURCE ROW"].astype(int).isin(candidate_stream_source_rows)
     ]
     extra_records = [_result_from_stream(row) for _, row in extra_rows.iterrows()]
     extra = _records_frame(extra_records)
@@ -1293,9 +1361,19 @@ def reconcile_dat_vs_stream(
 
     missing_billing = missing.copy().reset_index(drop=True)
     missing_non_billable = pd.DataFrame(columns=missing.columns)
+    validasi = missing.loc[
+        missing["VALIDASI"].eq(VALIDATION_NOT_FOUND)
+    ].copy().reset_index(drop=True)
 
     unique_dat_total = len(dat_unique)
     matched_total = len(matched)
+    validation_found_total = int(
+        matched["VALIDASI"].eq(VALIDATION_FOUND).sum()
+    )
+    validation_review_total = int(
+        missing["VALIDASI"].eq(VALIDATION_REVIEW).sum()
+        + need_review["VALIDASI"].eq(VALIDATION_REVIEW).sum()
+    )
     accuracy = (matched_total / unique_dat_total * 100) if unique_dat_total else 0.0
     summary = {
         "total_dat_dep": len(dep),
@@ -1308,6 +1386,9 @@ def reconcile_dat_vs_stream(
         "missing_billing_review": len(missing_billing),
         "missing_non_billable_review": len(missing_non_billable),
         "need_review": len(need_review),
+        "total_ada_di_stream": validation_found_total,
+        "total_validasi": len(validasi),
+        "total_perlu_review_stream": validation_review_total,
         "extra_in_stream": len(extra),
         "duplicate_dat": len(duplicate_dat),
         "excluded_dat_non_billable": len(dat_excluded),
@@ -1327,6 +1408,12 @@ def reconcile_dat_vs_stream(
             ("Missing in Stream", summary["missing_in_stream"]),
             ("Missing Billing Review", summary["missing_billing_review"]),
             ("Need Review", summary["need_review"]),
+            ("Total Ada di STREAM", summary["total_ada_di_stream"]),
+            ("Total Validasi", summary["total_validasi"]),
+            (
+                "Total Perlu Review STREAM",
+                summary["total_perlu_review_stream"],
+            ),
             ("Extra in Stream", summary["extra_in_stream"]),
             ("Duplicate DAT", summary["duplicate_dat"]),
             ("Excluded DAT Non-Billable", summary["excluded_dat_non_billable"]),
@@ -1341,6 +1428,7 @@ def reconcile_dat_vs_stream(
         "missing": missing,
         "missing_billing": missing_billing,
         "missing_non_billable": missing_non_billable,
+        "validasi": validasi,
         "matched": matched,
         "need_review": need_review,
         "extra": extra,

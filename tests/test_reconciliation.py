@@ -5,6 +5,9 @@ import pandas as pd
 from openpyxl import load_workbook
 
 from reconciliation import (
+    VALIDATION_FOUND,
+    VALIDATION_NOT_FOUND,
+    VALIDATION_REVIEW,
     build_excel_report,
     reconcile_dat_vs_stream,
     validate_required_columns,
@@ -79,6 +82,7 @@ class ReconciliationTests(unittest.TestCase):
             workbook.sheetnames,
             [
                 "Summary",
+                "Validasi",
                 "Missing in Stream",
                 "Matched",
                 "Need Review",
@@ -108,6 +112,8 @@ class ReconciliationTests(unittest.TestCase):
                 "DEPARTURE GATE",
                 "DEPARTURE RUNWAY",
                 "ARRIVAL RUNWAY",
+                "VALIDASI",
+                "STATUS",
                 "MATCH_REASON",
                 "STREAM STATUS FLIGHT",
                 "DAT MOVEMENT DATETIME",
@@ -289,6 +295,110 @@ class ReconciliationTests(unittest.TestCase):
         self.assertEqual(reasons["TOL121"], "STREAM TIME MISMATCH")
         self.assertIn("STREAM INVALID ATD DATE", reasons["DATEBAD"])
 
+    def test_validation_only_contains_dat_without_any_stream_candidate(self):
+        dep = pd.DataFrame(
+            {
+                "callsign": ["FOUND1", "ABSENT1", "OTHER1"],
+                "adep": ["WIMM"] * 3,
+                "ades": ["WIII"] * 3,
+                "eobd": ["260624"] * 3,
+                "atd": ["10:00", "11:00", "12:00"],
+                "register": ["PKAAA", "PKBBB", "PKCCC"],
+            }
+        )
+        arr = pd.DataFrame(columns=["callsign", "adep", "ades", "eobd"])
+        stream = pd.DataFrame(
+            {
+                "DATE OF FLIGHT": ["2026-06-24", "2026-06-24"],
+                "FLIGHT NUMBER": ["FOUND1", "OTHER1"],
+                "AERODROME": ["WIMM", "WIMM"],
+                "TO FROM": ["WIII", "WIII"],
+                "AC REGISTER": ["PKAAA", "PKCCC"],
+                "D/A/L/O": ["D", "D"],
+                "ATD": ["2026-06-24 10:05", "2026-06-24 12:00"],
+                "STATUS FLIGHT": ["REGULER", "OTHER"],
+            }
+        )
+
+        result = reconcile_dat_vs_stream(dep, arr, stream)
+
+        self.assertEqual(
+            result["matched"].iloc[0]["VALIDASI"], VALIDATION_FOUND
+        )
+        missing_validation = result["missing"].set_index("FLIGHT NUMBER")[
+            "VALIDASI"
+        ]
+        self.assertEqual(missing_validation["ABSENT1"], VALIDATION_NOT_FOUND)
+        self.assertEqual(missing_validation["OTHER1"], VALIDATION_REVIEW)
+        self.assertEqual(set(result["validasi"]["FLIGHT NUMBER"]), {"ABSENT1"})
+        self.assertEqual(result["summary"]["total_ada_di_stream"], 1)
+        self.assertEqual(result["summary"]["total_validasi"], 1)
+        self.assertEqual(result["summary"]["total_perlu_review_stream"], 1)
+        self.assertLessEqual(
+            result["summary"]["total_validasi"],
+            result["summary"]["missing_in_stream"],
+        )
+
+        workbook = load_workbook(
+            io.BytesIO(build_excel_report(result)), read_only=True
+        )
+        validation_sheet = workbook["Validasi"]
+        headers = [cell.value for cell in validation_sheet[4]]
+        validation_column = headers.index("VALIDASI") + 1
+        self.assertEqual(validation_sheet.max_row, 5)
+        self.assertEqual(
+            validation_sheet.cell(5, validation_column).value,
+            VALIDATION_NOT_FOUND,
+        )
+
+    def test_actual_movement_index_matches_when_stream_flight_date_is_unrelated(self):
+        dep = pd.DataFrame(
+            {
+                "callsign": ["ACTD01"],
+                "adep": ["WIMM"],
+                "ades": ["WIII"],
+                "eobd": ["260624"],
+                "atd": ["2026-06-25 00:10"],
+                "register": ["PKDEP"],
+            }
+        )
+        arr = pd.DataFrame(
+            {
+                "callsign": ["ACTA01"],
+                "adep": ["WIII"],
+                "ades": ["WIMM"],
+                "eobd": ["260624"],
+                "ata": ["2026-06-25 02:20"],
+                "register": ["PKARR"],
+            }
+        )
+        stream = pd.DataFrame(
+            {
+                "DATE OF FLIGHT": ["2026-06-23", "2026-06-23"],
+                "FLIGHT NUMBER": ["ACTD01", "ACTA01"],
+                "AERODROME": ["WIMM", "WIII"],
+                "TO FROM": ["WIII", "WIMM"],
+                "AC REGISTER": ["PKDEP", "PKARR"],
+                "D/A/L/O": ["D", "A"],
+                "ATD": ["2026-06-25 00:15", ""],
+                "ATA": ["", "2026-06-25 02:25"],
+                "STATUS FLIGHT": ["REGULER", "REGULER"],
+            }
+        )
+
+        result = reconcile_dat_vs_stream(dep, arr, stream)
+
+        self.assertEqual(set(result["matched"]["FLIGHT NUMBER"]), {"ACTD01", "ACTA01"})
+        self.assertTrue(result["missing"].empty)
+        self.assertTrue(result["validasi"].empty)
+        self.assertEqual(
+            set(result["matched"]["STREAM MATCH MODE"]),
+            {"ACTUAL MOVEMENT DATE MATCH"},
+        )
+        self.assertEqual(
+            set(result["matched"]["VALIDASI"]), {VALIDATION_FOUND}
+        )
+
     def test_non_billable_flight_is_hard_excluded(self):
         dep = pd.DataFrame(
             {
@@ -389,8 +499,9 @@ class ReconciliationTests(unittest.TestCase):
         self.assertEqual(int(recovered["DAT_RECOVERY_SOURCE_ROW"]), 3)
         self.assertEqual(
             recovered["MATCH_REASON"],
-            "STREAM NOT FOUND AFTER ORIGINAL AND RECOVERED DATE SEARCH",
+            "STREAM NOT FOUND AFTER ACTUAL MOVEMENT, ORIGINAL, AND RECOVERED DATE SEARCH",
         )
+        self.assertEqual(recovered["VALIDASI"], VALIDATION_NOT_FOUND)
         self.assertEqual(recovered["STREAM MATCH MODE"], "NO STREAM MATCH")
         self.assertEqual(len(result["duplicates"]), 1)
         self.assertTrue(bool(result["duplicates"].iloc[0]["USED_FOR_RECOVERY"]))
@@ -433,13 +544,21 @@ class ReconciliationTests(unittest.TestCase):
         matched = result["matched"].iloc[0]
         self.assertEqual(matched["DATE OF FLIGHT"], "2026-06-23")
         self.assertEqual(matched["ACTUAL MOVEMENT DATE"], "2026-06-24")
-        self.assertEqual(matched["MATCH_REASON"], "VALID STREAM MATCH BY RECOVERED DATE")
+        self.assertEqual(
+            matched["MATCH_REASON"],
+            "VALID STREAM MATCH BY ACTUAL MOVEMENT DATE",
+        )
         self.assertEqual(
             matched["STREAM VALIDATION RESULT"],
-            "VALID STREAM CANDIDATE BY RECOVERED DATE",
+            "VALID STREAM CANDIDATE BY ACTUAL MOVEMENT DATE",
         )
-        self.assertEqual(matched["STREAM MATCH DATE USED"], "RECOVERED_DAT_DATE")
-        self.assertEqual(matched["STREAM MATCH MODE"], "RECOVERED DATE MATCH")
+        self.assertEqual(
+            matched["STREAM MATCH DATE USED"], "ACTUAL MOVEMENT DATE"
+        )
+        self.assertEqual(
+            matched["STREAM MATCH MODE"], "ACTUAL MOVEMENT DATE MATCH"
+        )
+        self.assertEqual(matched["VALIDASI"], VALIDATION_FOUND)
         self.assertEqual(matched["STREAM MOVEMENT DATETIME"], "2026-06-24 02:52")
         self.assertEqual(float(matched["TIME DIFFERENCE MINUTES"]), 0.0)
         self.assertTrue(bool(matched["DAT_RECOVERY_USED"]))
@@ -472,8 +591,13 @@ class ReconciliationTests(unittest.TestCase):
         )
         result = reconcile_dat_vs_stream(dep, arr, stream)
         matched = result["matched"].iloc[0]
-        self.assertEqual(matched["MATCH_REASON"], "VALID STREAM MATCH")
-        self.assertEqual(matched["STREAM MATCH MODE"], "ORIGINAL DATE MATCH")
+        self.assertEqual(
+            matched["MATCH_REASON"],
+            "VALID STREAM MATCH BY ACTUAL MOVEMENT DATE",
+        )
+        self.assertEqual(
+            matched["STREAM MATCH MODE"], "ACTUAL MOVEMENT DATE MATCH"
+        )
         self.assertEqual(float(matched["TIME DIFFERENCE MINUTES"]), 0.0)
 
     def test_recovered_time_match_with_register_mismatch_needs_review(self):
@@ -507,7 +631,10 @@ class ReconciliationTests(unittest.TestCase):
         self.assertTrue(result["matched"].empty)
         reviewed = result["need_review"].iloc[0]
         self.assertEqual(reviewed["MATCH_REASON"], "STREAM AC REGISTER MISMATCH")
-        self.assertEqual(reviewed["STREAM MATCH MODE"], "RECOVERED DATE MATCH")
+        self.assertEqual(
+            reviewed["STREAM MATCH MODE"], "ACTUAL MOVEMENT DATE MATCH"
+        )
+        self.assertEqual(reviewed["VALIDASI"], VALIDATION_REVIEW)
         self.assertEqual(float(reviewed["TIME DIFFERENCE MINUTES"]), 0.0)
 
     def test_exact_register_within_tolerance_beats_closer_mismatch(self):
@@ -536,7 +663,10 @@ class ReconciliationTests(unittest.TestCase):
         )
         result = reconcile_dat_vs_stream(dep, arr, stream)
         matched = result["matched"].iloc[0]
-        self.assertEqual(matched["MATCH_REASON"], "VALID STREAM MATCH")
+        self.assertEqual(
+            matched["MATCH_REASON"],
+            "VALID STREAM MATCH BY ACTUAL MOVEMENT DATE",
+        )
         self.assertEqual(float(matched["TIME DIFFERENCE MINUTES"]), 1.0)
         self.assertEqual(int(matched["STREAM SOURCE ROW"]), 3)
 
@@ -597,9 +727,16 @@ class ReconciliationTests(unittest.TestCase):
         self.assertEqual(matched["DATE OF FLIGHT"], "2026-06-22")
         self.assertEqual(matched["ACTUAL MOVEMENT DATE"], "2026-06-23")
         self.assertEqual(matched["ATA"], "01:42")
-        self.assertEqual(matched["MATCH_REASON"], "VALID STREAM MATCH")
-        self.assertEqual(matched["STREAM MATCH DATE USED"], "DATE OF FLIGHT")
-        self.assertEqual(matched["STREAM MATCH MODE"], "ORIGINAL DATE MATCH")
+        self.assertEqual(
+            matched["MATCH_REASON"],
+            "VALID STREAM MATCH BY ACTUAL MOVEMENT DATE",
+        )
+        self.assertEqual(
+            matched["STREAM MATCH DATE USED"], "ACTUAL MOVEMENT DATE"
+        )
+        self.assertEqual(
+            matched["STREAM MATCH MODE"], "ACTUAL MOVEMENT DATE MATCH"
+        )
 
     def test_overnight_arrival_can_match_by_actual_movement_date(self):
         dep = pd.DataFrame(columns=["callsign", "adep", "ades", "eobd"])

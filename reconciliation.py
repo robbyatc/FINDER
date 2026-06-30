@@ -1,14 +1,23 @@
 """Backward-compatible public API for FINDER's reconciliation modules."""
 
-from utils.exporter import MISSING_EXPORT_COLUMNS, build_excel_report
+from utils.exporter import (
+    MISSING_EXPORT_COLUMNS,
+    VALIDATION_EXPORT_COLUMNS,
+    build_excel_report,
+)
 from utils.reconciliation import (
     AUDIT_COLUMNS,
     DEFAULT_INVALID_STREAM_STATUSES,
     DETAIL_COLUMNS,
+    DISPLAY_RESULT_COLUMNS,
     DUPLICATE_AUDIT_COLUMNS,
     MATCH_KEY_SPECS,
     RECOVERY_AUDIT_COLUMNS,
     RESULT_COLUMNS,
+    VALIDATION_FOUND,
+    VALIDATION_NOT_FOUND,
+    VALIDATION_REVIEW,
+    VALIDATION_VALUES,
     deduplicate_dat,
     detected_mapping,
     read_uploaded_table,
@@ -23,11 +32,17 @@ __all__ = [
     "AUDIT_COLUMNS",
     "DEFAULT_INVALID_STREAM_STATUSES",
     "DETAIL_COLUMNS",
+    "DISPLAY_RESULT_COLUMNS",
     "DUPLICATE_AUDIT_COLUMNS",
     "MATCH_KEY_SPECS",
     "MISSING_EXPORT_COLUMNS",
+    "VALIDATION_EXPORT_COLUMNS",
     "RECOVERY_AUDIT_COLUMNS",
     "RESULT_COLUMNS",
+    "VALIDATION_FOUND",
+    "VALIDATION_NOT_FOUND",
+    "VALIDATION_REVIEW",
+    "VALIDATION_VALUES",
     "build_excel_report",
     "deduplicate_dat",
     "detected_mapping",

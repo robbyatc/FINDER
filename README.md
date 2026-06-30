@@ -19,14 +19,15 @@ Buka FINDER dari komputer, tablet, atau ponsel melalui:
 - Hasil: Missing in Stream, Matched, Need Review, Extra in Stream, dan Duplicate DAT.
 - Hard exclude Non-Billable/Internal Movement sebelum recovery, deduplikasi, dan reconciliation.
 - Adjacent Date / Midnight Recovery dari RAW DAT yang sudah dinormalisasi.
-- Fallback STREAM matching melalui original date, recovered date, lalu actual movement date.
+- Matching utama STREAM melalui tanggal actual movement (ATD untuk departure, ATA untuk arrival), lalu original/recovered date sebagai fallback.
 - Recovered movement date validation dan AC-register mismatch routing ke Need Review.
 - Deduplikasi per flight instance agar pergerakan berbeda tidak saling menimpa.
 - Audit reason untuk setiap hasil dan candidate STREAM.
 - Kolom Actual Movement Date dari ATA untuk arrival atau ATD untuk departure, tanpa mengubah EOBD sebagai base key.
 - Filter Missing in Stream berdasarkan tanggal, flight number, aerodrome, TO FROM, dan movement.
-- Dashboard metrik dan accuracy percentage.
-- Laporan Excel dengan sheet Summary, Missing in Stream, Matched, Extra in Stream, dan Duplicate DAT.
+- Kolom VALIDASI: ADA DI STREAM, ADA DI DAT TIDAK ADA DI STREAM, atau PERLU REVIEW STREAM.
+- Dashboard metrik Validasi dan accuracy percentage.
+- Laporan Excel sembilan sheet, termasuk Validasi, Audit Detail, dan Excluded Non-Billable.
 
 ## Menjalankan aplikasi
 
@@ -51,19 +52,21 @@ Pada penggunaan pertama, launcher membuat virtual environment dan memasang depen
 2. Unggah DAT DEP, DAT ARR, dan STREAM.
 3. Pastikan validation checklist berwarna hijau.
 4. Klik **PROCESS RECONCILIATION**.
-5. Buka **Reconciliation Result** dan periksa tab **Missing in Stream**.
+5. Buka **Reconciliation Result** dan periksa tab **Validasi**.
 6. Gunakan filter untuk mempersempit pemeriksaan.
 7. Buka **Export Report** dan klik **Download Excel Report**.
 
 ## Logika pencocokan
 
-Record dicocokkan menggunakan kombinasi:
+Record diprioritaskan berdasarkan tanggal/waktu actual movement dan kombinasi:
 
-- Date of Flight / EOBD
+- ATD untuk departure atau ATA untuk arrival
 - Flight Number / Callsign
 - ADEP / Aerodrome
 - ADES / TO FROM
 - Movement Type (D/A/L/O)
+
+Date of Flight/EOBD tetap ditampilkan dan digunakan sebagai fallback bersama recovered date. Sheet Validasi hanya memuat DAT yang tidak memiliki kandidat STREAM pada seluruh jalur pencarian; kandidat dengan masalah status, tanggal, waktu, atau register diberi VALIDASI `PERLU REVIEW STREAM`.
 
 Untuk setiap base key, FINDER memilih satu DAT terbaik: movement time terisi, completeness score tertinggi, timestamp terbaru, lalu message number terbesar. Hanya record yang tidak terpilih masuk Duplicate DAT; record terbaik selalu dipakai dalam reconciliation.
 
