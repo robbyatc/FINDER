@@ -11,6 +11,7 @@ from comparison import (
     actual_file_format_label,
     detect_mapping,
     excel_sheet_names,
+    normalize_header,
     read_actual_excel,
     read_source_csv,
 )
@@ -58,12 +59,47 @@ VALIDATION_VALUES = (
 )
 DISPLAY_RESULT_COLUMNS = RESULT_COLUMNS + ["VALIDASI"]
 
+SPECIAL_REMARK_KEYWORDS = (
+    "DIVERT",
+    "DIVERSION",
+    "DVT",
+    "RTB",
+    "RETURN TO BASE",
+    "RETURN",
+    "REROUTE",
+    "ALTN",
+    "ALTERNATE",
+)
+SPECIAL_REMARK_SOURCE_COLUMNS = {
+    normalize_header(column)
+    for column in (
+        "REMARK",
+        "REMARKS",
+        "KETERANGAN",
+        "STATUS FLIGHT",
+        "NOTE",
+        "NOTES",
+    )
+}
+SPECIAL_REMARK_TEXT_COLUMNS = {
+    normalize_header(column)
+    for column in ("REMARK", "REMARKS", "KETERANGAN", "NOTE", "NOTES")
+}
+SPECIAL_REMARK_AUDIT_COLUMNS = [
+    "STREAM REMARK",
+    "STREAM SPECIAL REMARK FLAG",
+    "ROUTE MATCH IGNORED",
+    "SPECIAL REMARK KEYWORD FOUND",
+]
+
 AUDIT_COLUMNS = [
     "SOURCE DATA",
     "SOURCE ROW",
     "STATUS",
     "MATCH_REASON",
     "STREAM STATUS FLIGHT",
+    "STREAM REMARK",
+    "STREAM SPECIAL REMARK FLAG",
     "DAT MOVEMENT DATETIME",
     "STREAM MOVEMENT DATETIME",
     "TIME DIFFERENCE MINUTES",
@@ -73,6 +109,8 @@ AUDIT_COLUMNS = [
     "STREAM VALIDATION RESULT",
     "STREAM MATCH DATE USED",
     "STREAM MATCH MODE",
+    "ROUTE MATCH IGNORED",
+    "SPECIAL REMARK KEYWORD FOUND",
     "BILLING CATEGORY",
     "DAT_RECOVERY_USED",
     "DAT_RECOVERY_REASON",
@@ -139,6 +177,9 @@ STANDARDIZED_COLUMNS = RESULT_COLUMNS + [
     "SOURCE DATA",
     "SOURCE ROW",
     "STREAM STATUS FLIGHT",
+    "STREAM REMARK",
+    "STREAM SPECIAL REMARK FLAG",
+    "SPECIAL REMARK KEYWORD FOUND",
     "TIMESTAMP",
     "MESSAGE NUM",
     "EOBT",
@@ -167,6 +208,46 @@ STANDARDIZED_COLUMNS = RESULT_COLUMNS + [
 def is_excluded_flight_number(flight_number: object) -> bool:
     """Hard filter for non-billable/internal callsigns."""
     return _is_excluded_flight_number(flight_number)
+
+
+def _special_remark_text_parts(
+    row: pd.Series, include_status: bool = True
+) -> list[str]:
+    parts: list[str] = []
+    for column in row.index:
+        normalized_column = normalize_header(column)
+        is_standardized_remark = str(column) == "STREAM REMARK"
+        if not is_standardized_remark and normalized_column not in (
+            SPECIAL_REMARK_SOURCE_COLUMNS
+            if include_status
+            else SPECIAL_REMARK_TEXT_COLUMNS
+        ):
+            continue
+        value = clean_text(row.get(column, ""))
+        if value and value.upper() not in {part.upper() for part in parts}:
+            parts.append(value)
+    return parts
+
+
+def special_stream_remark_keyword(row: pd.Series) -> str:
+    """Return the first configured special-operation keyword found in STREAM."""
+    combined_text = " ".join(_special_remark_text_parts(row)).upper().strip()
+    return next(
+        (keyword for keyword in SPECIAL_REMARK_KEYWORDS if keyword in combined_text),
+        "",
+    )
+
+
+def has_special_stream_remark(row: pd.Series) -> bool:
+    return bool(special_stream_remark_keyword(row))
+
+
+def _stream_remark_display(row: pd.Series) -> str:
+    remark_parts = _special_remark_text_parts(row, include_status=False)
+    if remark_parts:
+        return " / ".join(remark_parts)
+    status_parts = _special_remark_text_parts(row, include_status=True)
+    return " / ".join(status_parts) if special_stream_remark_keyword(row) else ""
 
 
 def read_uploaded_table(data: bytes, filename: str) -> tuple[pd.DataFrame, str]:
@@ -268,6 +349,12 @@ def standardize_dataset(
             and flight_date_value is not None
             and pd.Timestamp(move_datetime).date() != flight_date_value
         )
+        special_remark_keyword = (
+            special_stream_remark_keyword(row) if source_name == "STREAM" else ""
+        )
+        stream_remark = (
+            _stream_remark_display(row) if source_name == "STREAM" else ""
+        )
 
         record = {
             "DATE OF FLIGHT": date_of_flight,
@@ -290,6 +377,9 @@ def standardize_dataset(
             "SOURCE DATA": source_name,
             "SOURCE ROW": source_index,
             "STREAM STATUS FLIGHT": normalize_code(raw["status_flight"]),
+            "STREAM REMARK": stream_remark,
+            "STREAM SPECIAL REMARK FLAG": bool(special_remark_keyword),
+            "SPECIAL REMARK KEYWORD FOUND": special_remark_keyword,
             "TIMESTAMP": normalize_display_text(raw["timestamp"]),
             "MESSAGE NUM": normalize_display_text(raw["message_num"]),
             "EOBT": format_time(eobt_datetime) or normalize_display_text(raw["eobt"]),
@@ -493,6 +583,8 @@ def _prepare_keys(frame: pd.DataFrame, side: str) -> pd.DataFrame:
         prepared["__match_key"] = pd.Series(dtype=object)
         prepared["__movement_match_key"] = pd.Series(dtype=object)
         prepared["__complete_movement_key"] = pd.Series(dtype=bool)
+        prepared["__special_match_key"] = pd.Series(dtype=object)
+        prepared["__complete_special_key"] = pd.Series(dtype=bool)
         prepared["DUPLICATE_GROUP_KEY"] = pd.Series(dtype=object)
         return prepared
     prepared["__match_key"] = prepared[key_columns].astype(str).agg("␟".join, axis=1)
@@ -529,6 +621,21 @@ def _prepare_keys(frame: pd.DataFrame, side: str) -> pd.DataFrame:
     ].apply(
         lambda row: (
             f"__INCOMPLETE_MOVEMENT__{side}__"
+            f"{row['SOURCE DATA']}__{row['SOURCE ROW']}"
+        ),
+        axis=1,
+    )
+    special_key_frame = prepared[["__key_flight", "__key_movement"]]
+    prepared["__complete_special_key"] = special_key_frame.ne("").all(axis=1)
+    prepared["__special_match_key"] = special_key_frame.astype(str).agg(
+        "␟".join, axis=1
+    )
+    incomplete_special = ~prepared["__complete_special_key"]
+    prepared.loc[incomplete_special, "__special_match_key"] = prepared.loc[
+        incomplete_special
+    ].apply(
+        lambda row: (
+            f"__INCOMPLETE_SPECIAL__{side}__"
             f"{row['SOURCE DATA']}__{row['SOURCE ROW']}"
         ),
         axis=1,
@@ -829,6 +936,29 @@ def _stream_search_specs(dat_row: pd.Series) -> list[dict[str, str]]:
     return specs
 
 
+def _special_candidate_is_eligible(
+    dat_row: pd.Series,
+    stream_row: pd.Series,
+    time_tolerance_minutes: int,
+) -> bool:
+    if not bool(stream_row.get("STREAM SPECIAL REMARK FLAG", False)):
+        return False
+    dat_register = normalize_code(dat_row.get("AC REGISTER", ""))
+    stream_register = normalize_code(stream_row.get("AC REGISTER", ""))
+    if dat_register and stream_register and dat_register != stream_register:
+        return False
+    dat_datetime = _timestamp(dat_row.get("DAT_MOVEMENT_DATETIME"))
+    stream_datetime = _timestamp(stream_row.get("STREAM_MOVEMENT_DATETIME"))
+    if dat_datetime is None or stream_datetime is None:
+        return False
+    if abs((stream_datetime.date() - dat_datetime.date()).days) > 1:
+        return False
+    time_difference = abs(
+        (stream_datetime - dat_datetime).total_seconds() / 60.0
+    )
+    return time_difference <= time_tolerance_minutes
+
+
 def _candidate_evaluation(
     dat_row: pd.Series,
     stream_row: pd.Series,
@@ -846,6 +976,16 @@ def _candidate_evaluation(
     register_mismatch = bool(
         dat_register and stream_register and dat_register != stream_register
     )
+    special_remark_keyword = normalize_display_text(
+        stream_row.get("SPECIAL REMARK KEYWORD FOUND", "")
+    ).upper()
+    special_remark = bool(
+        stream_row.get("STREAM SPECIAL REMARK FLAG", False)
+        or special_remark_keyword
+    )
+    if special_remark:
+        match_date_used = "ACTUAL MOVEMENT DATE ±1 DAY"
+        match_mode = "SPECIAL REMARK MATCH"
     invalid_status = bool(
         treat_invalid_status_as_missing and stream_status in invalid_statuses
     )
@@ -867,7 +1007,10 @@ def _candidate_evaluation(
             (stream_datetime - dat_datetime).total_seconds() / 60.0
         )
         date_mismatch = (
-            stream_datetime.strftime("%Y-%m-%d") not in allowed_movement_dates
+            abs((stream_datetime.date() - dat_datetime.date()).days) > 1
+            if special_remark
+            else stream_datetime.strftime("%Y-%m-%d")
+            not in allowed_movement_dates
         )
 
     movement_field = "ATA" if dat_row["D/A/L/O"] == "A" else "ATD"
@@ -895,18 +1038,23 @@ def _candidate_evaluation(
             or time_difference > time_tolerance_minutes
             else 0
         ),
+        1 if special_remark else 0,
         1 if register_mismatch else 0,
         time_difference if time_difference is not None else float("inf"),
         {
             "ACTUAL MOVEMENT DATE MATCH": 0,
             "RECOVERED DATE MATCH": 1,
             "ORIGINAL DATE MATCH": 2,
+            "SPECIAL REMARK MATCH": 3,
         }.get(match_mode, 3),
         priority_value,
         -parse_message_number(stream_row["MESSAGE NUM"]),
         -int(stream_row["SOURCE ROW"]),
     )
     validation_result = {
+        "SPECIAL REMARK MATCH": (
+            "STREAM SPECIAL REMARK FOUND - ROUTE IGNORED FOR VALIDATION"
+        ),
         "RECOVERED DATE MATCH": "VALID STREAM CANDIDATE BY RECOVERED DATE",
         "ACTUAL MOVEMENT DATE MATCH": (
             "VALID STREAM CANDIDATE BY ACTUAL MOVEMENT DATE"
@@ -930,6 +1078,10 @@ def _candidate_evaluation(
         "date_mismatch": date_mismatch,
         "allowed_movement_dates": sorted(allowed_movement_dates),
         "register_mismatch": register_mismatch,
+        "special_remark": special_remark,
+        "stream_remark": stream_row.get("STREAM REMARK", ""),
+        "special_remark_keyword": special_remark_keyword,
+        "route_match_ignored": special_remark,
         "invalid_reasons": invalid_reasons,
         "validation_result": validation_result,
         "match_date_used": match_date_used,
@@ -971,6 +1123,26 @@ def _result_from_dat(
         if selected_evaluation
         else "NO STREAM MATCH"
     )
+    stream_remark = (
+        selected_evaluation.get("stream_remark", "")
+        if selected_evaluation
+        else ""
+    )
+    special_remark = bool(
+        selected_evaluation.get("special_remark", False)
+        if selected_evaluation
+        else False
+    )
+    route_match_ignored = bool(
+        selected_evaluation.get("route_match_ignored", False)
+        if selected_evaluation
+        else False
+    )
+    special_remark_keyword = (
+        selected_evaluation.get("special_remark_keyword", "")
+        if selected_evaluation
+        else ""
+    )
     if validasi is None:
         if selected_evaluation is None:
             validasi = VALIDATION_NOT_FOUND
@@ -986,6 +1158,8 @@ def _result_from_dat(
             "STATUS": status,
             "MATCH_REASON": reason,
             "STREAM STATUS FLIGHT": stream_status,
+            "STREAM REMARK": stream_remark,
+            "STREAM SPECIAL REMARK FLAG": special_remark,
             "DAT MOVEMENT DATETIME": format_datetime(
                 dat_row["DAT_MOVEMENT_DATETIME"]
             ),
@@ -1001,6 +1175,8 @@ def _result_from_dat(
             "STREAM VALIDATION RESULT": validation_result,
             "STREAM MATCH DATE USED": match_date_used,
             "STREAM MATCH MODE": match_mode,
+            "ROUTE MATCH IGNORED": route_match_ignored,
+            "SPECIAL REMARK KEYWORD FOUND": special_remark_keyword,
             "BILLING CATEGORY": "BILLING REVIEW",
             "DAT_RECOVERY_USED": bool(dat_row.get("DAT_RECOVERY_USED", False)),
             "DAT_RECOVERY_REASON": dat_row.get("DAT_RECOVERY_REASON", ""),
@@ -1032,6 +1208,10 @@ def _result_from_stream(stream_row: pd.Series) -> dict[str, object]:
             "STATUS": "EXTRA IN STREAM",
             "MATCH_REASON": "DAT NOT FOUND",
             "STREAM STATUS FLIGHT": stream_row["STREAM STATUS FLIGHT"],
+            "STREAM REMARK": stream_row.get("STREAM REMARK", ""),
+            "STREAM SPECIAL REMARK FLAG": bool(
+                stream_row.get("STREAM SPECIAL REMARK FLAG", False)
+            ),
             "DAT MOVEMENT DATETIME": "",
             "STREAM MOVEMENT DATETIME": format_datetime(
                 stream_row["STREAM_MOVEMENT_DATETIME"]
@@ -1043,6 +1223,10 @@ def _result_from_stream(stream_row: pd.Series) -> dict[str, object]:
             "STREAM VALIDATION RESULT": "DAT NOT FOUND",
             "STREAM MATCH DATE USED": "",
             "STREAM MATCH MODE": "NO STREAM MATCH",
+            "ROUTE MATCH IGNORED": False,
+            "SPECIAL REMARK KEYWORD FOUND": stream_row.get(
+                "SPECIAL REMARK KEYWORD FOUND", ""
+            ),
             "BILLING CATEGORY": "",
             "DAT_RECOVERY_USED": False,
             "DAT_RECOVERY_REASON": "",
@@ -1187,6 +1371,13 @@ def reconcile_dat_vs_stream(
             stream_prepared["__complete_movement_key"]
         ].groupby("__movement_match_key", sort=False)
     }
+    stream_special_groups = {
+        str(key): group.copy()
+        for key, group in stream_prepared.loc[
+            stream_prepared["__complete_special_key"]
+            & stream_prepared["STREAM SPECIAL REMARK FLAG"].fillna(False).astype(bool)
+        ].groupby("__special_match_key", sort=False)
+    }
 
     matched_records: list[dict[str, object]] = []
     missing_records: list[dict[str, object]] = []
@@ -1223,6 +1414,32 @@ def reconcile_dat_vs_stream(
                         or evaluation["selection_sort"] < existing["selection_sort"]
                     ):
                         evaluations_by_source_row[source_row] = evaluation
+        special_group = stream_special_groups.get(
+            str(dat_row.get("__special_match_key", ""))
+        )
+        if special_group is not None and not special_group.empty:
+            for _, stream_row in special_group.iterrows():
+                if not _special_candidate_is_eligible(
+                    dat_row, stream_row, time_tolerance_minutes
+                ):
+                    continue
+                evaluation = _candidate_evaluation(
+                    dat_row,
+                    stream_row,
+                    invalid_statuses,
+                    treat_invalid_stream_status_as_missing,
+                    time_tolerance_minutes,
+                    "ACTUAL MOVEMENT DATE ±1 DAY",
+                    "SPECIAL REMARK MATCH",
+                )
+                source_row = int(stream_row["SOURCE ROW"])
+                candidate_stream_source_rows.add(source_row)
+                existing = evaluations_by_source_row.get(source_row)
+                if (
+                    existing is None
+                    or evaluation["selection_sort"] < existing["selection_sort"]
+                ):
+                    evaluations_by_source_row[source_row] = evaluation
         evaluations = list(evaluations_by_source_row.values())
         if not evaluations:
             not_found_reason = (
@@ -1241,7 +1458,13 @@ def reconcile_dat_vs_stream(
         invalid_reasons = list(selected["invalid_reasons"])
         difference = selected["time_difference"]
         register_mismatch = bool(selected["register_mismatch"])
-        if invalid_reasons:
+        special_remark = bool(selected.get("special_remark", False))
+        if special_remark:
+            status = "NEED REVIEW"
+            reason = (
+                "STREAM SPECIAL REMARK FOUND - ROUTE IGNORED FOR VALIDATION"
+            )
+        elif invalid_reasons:
             status = "MISSING IN STREAM"
             reason = " / ".join(invalid_reasons)
         elif difference is None:
@@ -1315,6 +1538,8 @@ def reconcile_dat_vs_stream(
                 "STATUS": "DUPLICATE DAT",
                 "MATCH_REASON": duplicate_row.get("DUPLICATE_REASON", ""),
                 "STREAM STATUS FLIGHT": "",
+                "STREAM REMARK": "",
+                "STREAM SPECIAL REMARK FLAG": False,
                 "DAT MOVEMENT DATETIME": format_datetime(
                     duplicate_row.get("DAT_MOVEMENT_DATETIME")
                 ),
@@ -1328,6 +1553,8 @@ def reconcile_dat_vs_stream(
                 "STREAM VALIDATION RESULT": "NOT APPLICABLE",
                 "STREAM MATCH DATE USED": "",
                 "STREAM MATCH MODE": "NO STREAM MATCH",
+                "ROUTE MATCH IGNORED": False,
+                "SPECIAL REMARK KEYWORD FOUND": "",
                 "BILLING CATEGORY": "BILLING REVIEW",
                 "COMPLETENESS_SCORE": duplicate_row.get("COMPLETENESS_SCORE", ""),
                 "HAS_MOVEMENT_TIME": duplicate_row.get("HAS_MOVEMENT_TIME", ""),

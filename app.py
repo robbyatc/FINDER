@@ -31,7 +31,7 @@ st.set_page_config(
 # Clear reconciliation output created with an older result schema. Without this,
 # a long-lived Streamlit session can keep displaying a cached table that predates
 # newly added result columns even after the application has been redeployed.
-RESULT_SCHEMA_VERSION = "2026-06-30-actual-movement-validation-v5"
+RESULT_SCHEMA_VERSION = "2026-07-01-special-remark-validation-v6"
 if st.session_state.get("finder_result_schema_version") != RESULT_SCHEMA_VERSION:
     for stale_key in (
         "finder_results",
@@ -714,7 +714,7 @@ def render_results_page(results: dict[str, object]) -> None:
         result_table(results["matched"])
     with tabs[3]:
         st.warning(
-            "NEED REVIEW — STREAM valid, tetapi selisih waktu melebihi tolerance atau AC REGISTER berbeda."
+            "NEED REVIEW — Periksa selisih waktu/register atau special remark seperti DIVERT, RTB, dan ALTERNATE."
         )
         result_table(results["need_review"])
     with tabs[4]:
@@ -898,7 +898,7 @@ def render_about_page() -> None:
         with st.container(border=True):
             st.markdown("#### 🎯 Matching logic")
             st.markdown(
-                "Record diprioritaskan berdasarkan **tanggal/waktu actual movement ATD/ATA + Flight Number + ADEP/Aerodrome + ADES/TO FROM + Movement Type**. Date of Flight dan recovered date digunakan sebagai fallback."
+                "Record diprioritaskan berdasarkan **tanggal/waktu actual movement ATD/ATA + Flight Number + ADEP/Aerodrome + ADES/TO FROM + Movement Type**. Date of Flight dan recovered date digunakan sebagai fallback. Untuk special remark DIVERT/RTB/ALTERNATE, route boleh diabaikan dan hasil masuk Perlu Review STREAM."
             )
     with about_right:
         with st.container(border=True):

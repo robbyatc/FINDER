@@ -5,11 +5,13 @@ import pandas as pd
 from openpyxl import load_workbook
 
 from reconciliation import (
+    SPECIAL_REMARK_KEYWORDS,
     VALIDATION_FOUND,
     VALIDATION_NOT_FOUND,
     VALIDATION_REVIEW,
     build_excel_report,
     reconcile_dat_vs_stream,
+    special_stream_remark_keyword,
     validate_required_columns,
 )
 
@@ -119,6 +121,10 @@ class ReconciliationTests(unittest.TestCase):
                 "DAT MOVEMENT DATETIME",
                 "STREAM MOVEMENT DATETIME",
                 "TIME DIFFERENCE MINUTES",
+                "STREAM REMARK",
+                "STREAM SPECIAL REMARK FLAG",
+                "ROUTE MATCH IGNORED",
+                "SPECIAL REMARK KEYWORD FOUND",
                 "DAT_RECOVERY_USED",
                 "DAT_RECOVERY_REASON",
                 "DAT_RECOVERY_SOURCE_DATE",
@@ -398,6 +404,168 @@ class ReconciliationTests(unittest.TestCase):
         self.assertEqual(
             set(result["matched"]["VALIDASI"]), {VALIDATION_FOUND}
         )
+
+    def test_special_remark_ignores_route_and_is_excluded_from_validation(self):
+        dep = pd.DataFrame(
+            {
+                "callsign": ["ABC123"],
+                "adep": ["WIMM"],
+                "ades": ["WIII"],
+                "eobd": ["260525"],
+                "atd": ["06:14"],
+                "register": ["PKABC"],
+            }
+        )
+        arr = pd.DataFrame(columns=["callsign", "adep", "ades", "eobd"])
+        stream = pd.DataFrame(
+            {
+                "DATE OF FLIGHT": ["2026-05-25"],
+                "FLIGHT NUMBER": ["ABC123"],
+                "AERODROME": ["WIDD"],
+                "TO FROM": ["WADD"],
+                "AC REGISTER": ["PKABC"],
+                "D/A/L/O": ["D"],
+                "ATD": ["2026-05-25 06:16"],
+                "STATUS FLIGHT": ["REGULER"],
+                "REMARK": ["DIVERT"],
+            }
+        )
+
+        result = reconcile_dat_vs_stream(dep, arr, stream)
+
+        self.assertTrue(result["validasi"].empty)
+        self.assertTrue(result["missing"].empty)
+        self.assertEqual(len(result["need_review"]), 1)
+        reviewed = result["need_review"].iloc[0]
+        self.assertEqual(reviewed["VALIDASI"], VALIDATION_REVIEW)
+        self.assertEqual(
+            reviewed["MATCH_REASON"],
+            "STREAM SPECIAL REMARK FOUND - ROUTE IGNORED FOR VALIDATION",
+        )
+        self.assertEqual(reviewed["STREAM MATCH MODE"], "SPECIAL REMARK MATCH")
+        self.assertEqual(reviewed["STREAM REMARK"], "DIVERT")
+        self.assertTrue(bool(reviewed["STREAM SPECIAL REMARK FLAG"]))
+        self.assertTrue(bool(reviewed["ROUTE MATCH IGNORED"]))
+        self.assertEqual(reviewed["SPECIAL REMARK KEYWORD FOUND"], "DIVERT")
+        self.assertEqual(float(reviewed["TIME DIFFERENCE MINUTES"]), 2.0)
+        self.assertEqual(result["summary"]["total_validasi"], 0)
+        self.assertEqual(result["summary"]["total_perlu_review_stream"], 1)
+        self.assertEqual(result["summary"]["extra_in_stream"], 0)
+
+        workbook = load_workbook(
+            io.BytesIO(build_excel_report(result)), read_only=True
+        )
+        self.assertEqual(workbook["Validasi"].max_row, 4)
+        review_headers = [cell.value for cell in workbook["Need Review"][4]]
+        for audit_column in (
+            "STREAM REMARK",
+            "STREAM SPECIAL REMARK FLAG",
+            "STREAM MATCH MODE",
+            "ROUTE MATCH IGNORED",
+            "SPECIAL REMARK KEYWORD FOUND",
+        ):
+            self.assertIn(audit_column, review_headers)
+        review_values = {
+            header: workbook["Need Review"].cell(5, index + 1).value
+            for index, header in enumerate(review_headers)
+        }
+        self.assertEqual(review_values["STREAM REMARK"], "DIVERT")
+        self.assertTrue(review_values["STREAM SPECIAL REMARK FLAG"])
+        self.assertTrue(review_values["ROUTE MATCH IGNORED"])
+        self.assertEqual(
+            review_values["SPECIAL REMARK KEYWORD FOUND"], "DIVERT"
+        )
+
+    def test_all_special_remark_keywords_are_detected(self):
+        for keyword in SPECIAL_REMARK_KEYWORDS:
+            with self.subTest(keyword=keyword):
+                row = pd.Series({"NOTES": f"OPERATION {keyword} CONFIRMED"})
+                self.assertEqual(special_stream_remark_keyword(row), keyword)
+
+    def test_special_remark_route_fallback_requires_register_and_tolerance(self):
+        dep = pd.DataFrame(
+            {
+                "callsign": ["REGFAIL", "TIMEFAIL"],
+                "adep": ["WIMM", "WIMM"],
+                "ades": ["WIII", "WIII"],
+                "eobd": ["260525", "260525"],
+                "atd": ["06:14", "07:00"],
+                "register": ["PKAAA", "PKBBB"],
+            }
+        )
+        arr = pd.DataFrame(columns=["callsign", "adep", "ades", "eobd"])
+        stream = pd.DataFrame(
+            {
+                "DATE OF FLIGHT": ["2026-05-25", "2026-05-25"],
+                "FLIGHT NUMBER": ["REGFAIL", "TIMEFAIL"],
+                "AERODROME": ["WIDD", "WIDD"],
+                "TO FROM": ["WADD", "WADD"],
+                "AC REGISTER": ["PKXXX", "PKBBB"],
+                "D/A/L/O": ["D", "D"],
+                "ATD": ["2026-05-25 06:16", "2026-05-25 08:00"],
+                "REMARKS": ["RTB", "ALTERNATE"],
+            }
+        )
+
+        result = reconcile_dat_vs_stream(dep, arr, stream)
+
+        self.assertEqual(
+            set(result["validasi"]["FLIGHT NUMBER"]),
+            {"REGFAIL", "TIMEFAIL"},
+        )
+        self.assertTrue(result["need_review"].empty)
+        self.assertEqual(result["summary"]["total_validasi"], 2)
+
+    def test_special_remark_arrival_accepts_adjacent_date_and_normal_wins(self):
+        dep = pd.DataFrame(columns=["callsign", "adep", "ades", "eobd"])
+        arr = pd.DataFrame(
+            {
+                "callsign": ["ARRSP1", "NORMAL1"],
+                "adep": ["WIII", "WIII"],
+                "ades": ["WIMM", "WIMM"],
+                "eobd": ["260525", "260525"],
+                "ata": ["2026-05-25 23:55", "2026-05-25 10:00"],
+                "register": ["PKARR", "PKNRM"],
+            }
+        )
+        stream = pd.DataFrame(
+            {
+                "DATE OF FLIGHT": [
+                    "2026-05-26",
+                    "2026-05-25",
+                    "2026-05-25",
+                ],
+                "FLIGHT NUMBER": ["ARRSP1", "NORMAL1", "NORMAL1"],
+                "AERODROME": ["WIDD", "WIII", "WIDD"],
+                "TO FROM": ["WADD", "WIMM", "WADD"],
+                "AC REGISTER": ["PKARR", "PKNRM", "PKNRM"],
+                "D/A/L/O": ["A", "A", "A"],
+                "ATA": [
+                    "2026-05-26 00:10",
+                    "2026-05-25 10:05",
+                    "2026-05-25 10:00",
+                ],
+                "STATUS FLIGHT": ["RTB", "REGULER", "REGULER"],
+                "NOTE": ["", "", "DIVERSION"],
+            }
+        )
+
+        result = reconcile_dat_vs_stream(dep, arr, stream)
+
+        special = result["need_review"].loc[
+            result["need_review"]["FLIGHT NUMBER"].eq("ARRSP1")
+        ].iloc[0]
+        self.assertEqual(special["STREAM MATCH MODE"], "SPECIAL REMARK MATCH")
+        self.assertEqual(special["SPECIAL REMARK KEYWORD FOUND"], "RTB")
+        self.assertEqual(float(special["TIME DIFFERENCE MINUTES"]), 15.0)
+        normal = result["matched"].loc[
+            result["matched"]["FLIGHT NUMBER"].eq("NORMAL1")
+        ].iloc[0]
+        self.assertEqual(normal["VALIDASI"], VALIDATION_FOUND)
+        self.assertEqual(
+            normal["STREAM MATCH MODE"], "ACTUAL MOVEMENT DATE MATCH"
+        )
+        self.assertFalse(bool(normal["STREAM SPECIAL REMARK FLAG"]))
 
     def test_non_billable_flight_is_hard_excluded(self):
         dep = pd.DataFrame(
