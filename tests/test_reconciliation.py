@@ -9,6 +9,7 @@ from reconciliation import (
     VALIDATION_FOUND,
     VALIDATION_NOT_FOUND,
     VALIDATION_REVIEW,
+    VALIDATION_REVIEW_DAT,
     build_excel_report,
     reconcile_dat_vs_stream,
     special_stream_remark_keyword,
@@ -350,11 +351,121 @@ class ReconciliationTests(unittest.TestCase):
         )
         validation_sheet = workbook["Validasi"]
         headers = [cell.value for cell in validation_sheet[4]]
+        self.assertEqual(
+            headers,
+            [
+                "DATE OF FLIGHT",
+                "ACTUAL MOVEMENT DATE",
+                "FLIGHT NUMBER",
+                "AERODROME",
+                "TO FROM",
+                "AC REGISTER",
+                "ATD",
+                "ATA",
+                "D/A/L/O",
+                "ARRIVAL GATE",
+                "DEPARTURE GATE",
+                "DEPARTURE RUNWAY",
+                "ARRIVAL RUNWAY",
+                "VALIDASI",
+                "MATCH_REASON",
+                "DAT_RECOVERY_USED",
+                "STREAM MATCH MODE",
+            ],
+        )
         validation_column = headers.index("VALIDASI") + 1
         self.assertEqual(validation_sheet.max_row, 5)
         self.assertEqual(
             validation_sheet.cell(5, validation_column).value,
             VALIDATION_NOT_FOUND,
+        )
+
+    def test_empty_dat_movement_time_is_review_dat_not_validation(self):
+        dep = pd.DataFrame(
+            {
+                "callsign": ["PKCAA", "PKCAB"],
+                "adep": ["WIMM", "WIMM"],
+                "ades": ["WIHH", "WIII"],
+                "eobd": ["260524", "260524"],
+                "atd": ["", ""],
+                "ata": ["", "12:00"],
+            }
+        )
+        arr = pd.DataFrame(
+            {
+                "callsign": ["PKCAC"],
+                "adep": ["WIHH"],
+                "ades": ["WIMM"],
+                "eobd": ["260524"],
+                "atd": ["10:00"],
+                "ata": [""],
+            }
+        )
+        stream = pd.DataFrame(
+            {
+                "DATE OF FLIGHT": ["2026-05-24"],
+                "FLIGHT NUMBER": ["PKCAA"],
+                "AERODROME": ["WIMM"],
+                "TO FROM": ["WIHH"],
+                "D/A/L/O": ["D"],
+                "ATD": ["2026-05-24 09:00"],
+            }
+        )
+
+        result = reconcile_dat_vs_stream(dep, arr, stream)
+
+        self.assertTrue(result["validasi"].empty)
+        review_dat = result["missing"].loc[
+            result["missing"]["VALIDASI"].eq(VALIDATION_REVIEW_DAT)
+        ]
+        self.assertEqual(
+            set(review_dat["FLIGHT NUMBER"]), {"PKCAA", "PKCAB", "PKCAC"}
+        )
+        self.assertEqual(set(review_dat["MATCH_REASON"]), {"DAT MOVEMENT TIME EMPTY"})
+        self.assertEqual(result["summary"]["total_perlu_review_dat"], 3)
+        self.assertEqual(result["summary"]["total_validasi"], 0)
+
+        workbook = load_workbook(
+            io.BytesIO(build_excel_report(result)), read_only=True
+        )
+        self.assertEqual(workbook["Validasi"].max_row, 4)
+
+    def test_normal_candidate_in_actual_date_window_is_review_not_validation(self):
+        dep = pd.DataFrame(
+            {
+                "callsign": ["WINDOW1"],
+                "adep": ["WIMM"],
+                "ades": ["WIII"],
+                "eobd": ["260524"],
+                "atd": ["2026-05-24 23:55"],
+                "register": ["PKWIN"],
+            }
+        )
+        arr = pd.DataFrame(columns=["callsign", "adep", "ades", "eobd"])
+        stream = pd.DataFrame(
+            {
+                "DATE OF FLIGHT": ["2026-05-26"],
+                "FLIGHT NUMBER": ["WINDOW1"],
+                "AERODROME": ["WIMM"],
+                "TO FROM": ["WIII"],
+                "AC REGISTER": ["PKWIN"],
+                "D/A/L/O": ["D"],
+                "ATD": ["2026-05-25 00:10"],
+                "STATUS FLIGHT": ["REGULER"],
+            }
+        )
+
+        result = reconcile_dat_vs_stream(dep, arr, stream)
+
+        self.assertTrue(result["validasi"].empty)
+        reviewed = result["missing"].iloc[0]
+        self.assertEqual(reviewed["VALIDASI"], VALIDATION_REVIEW)
+        self.assertIn("STREAM INVALID ATD DATE", reviewed["MATCH_REASON"])
+        self.assertEqual(
+            reviewed["STREAM MATCH DATE USED"], "ACTUAL MOVEMENT DATE +1 DAY"
+        )
+        self.assertEqual(
+            reviewed["STREAM MATCH MODE"], "ACTUAL MOVEMENT DATE WINDOW MATCH"
         )
 
     def test_actual_movement_index_matches_when_stream_flight_date_is_unrelated(self):
@@ -481,6 +592,49 @@ class ReconciliationTests(unittest.TestCase):
             with self.subTest(keyword=keyword):
                 row = pd.Series({"NOTES": f"OPERATION {keyword} CONFIRMED"})
                 self.assertEqual(special_stream_remark_keyword(row), keyword)
+
+    def test_special_operation_checkbox_columns_are_detected(self):
+        dep = pd.DataFrame(
+            {
+                "callsign": ["CHKDIV", "CHKRTB"],
+                "adep": ["WIMM", "WIMM"],
+                "ades": ["WIII", "WIII"],
+                "eobd": ["260525", "260525"],
+                "atd": ["06:14", "07:14"],
+                "register": ["PKDIV", "PKRTB"],
+            }
+        )
+        arr = pd.DataFrame(columns=["callsign", "adep", "ades", "eobd"])
+        stream = pd.DataFrame(
+            {
+                "DATE OF FLIGHT": ["2026-05-25", "2026-05-25"],
+                "FLIGHT NUMBER": ["CHKDIV", "CHKRTB"],
+                "AERODROME": ["WIDD", "WIDD"],
+                "TO FROM": ["WADD", "WADD"],
+                "AC REGISTER": ["PKDIV", "PKRTB"],
+                "D/A/L/O": ["D", "D"],
+                "ATD": ["2026-05-25 06:14", "2026-05-25 07:14"],
+                "STATUS FLIGHT": ["REGULER", "REGULER"],
+                "DIVERT": ["checked", ""],
+                "RTB/RTA": ["", "TRUE"],
+            }
+        )
+
+        result = reconcile_dat_vs_stream(dep, arr, stream)
+
+        self.assertTrue(result["validasi"].empty)
+        reviewed = result["need_review"].set_index("FLIGHT NUMBER")
+        self.assertEqual(
+            reviewed.loc["CHKDIV", "SPECIAL REMARK KEYWORD FOUND"], "DIVERT"
+        )
+        self.assertEqual(
+            reviewed.loc["CHKRTB", "SPECIAL REMARK KEYWORD FOUND"], "RTB"
+        )
+        self.assertEqual(
+            set(reviewed["MATCH_REASON"]),
+            {"STREAM SPECIAL REMARK FOUND - ROUTE IGNORED FOR VALIDATION"},
+        )
+        self.assertTrue(reviewed["ROUTE MATCH IGNORED"].astype(bool).all())
 
     def test_special_remark_route_fallback_requires_register_and_tolerance(self):
         dep = pd.DataFrame(
@@ -667,7 +821,7 @@ class ReconciliationTests(unittest.TestCase):
         self.assertEqual(int(recovered["DAT_RECOVERY_SOURCE_ROW"]), 3)
         self.assertEqual(
             recovered["MATCH_REASON"],
-            "STREAM NOT FOUND AFTER ACTUAL MOVEMENT, ORIGINAL, AND RECOVERED DATE SEARCH",
+            "STREAM NOT FOUND AFTER ACTUAL MOVEMENT WINDOW, ORIGINAL, AND RECOVERED DATE SEARCH",
         )
         self.assertEqual(recovered["VALIDASI"], VALIDATION_NOT_FOUND)
         self.assertEqual(recovered["STREAM MATCH MODE"], "NO STREAM MATCH")

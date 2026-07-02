@@ -19,14 +19,14 @@ Buka FINDER dari komputer, tablet, atau ponsel melalui:
 - Hasil: Missing in Stream, Matched, Need Review, Extra in Stream, dan Duplicate DAT.
 - Hard exclude Non-Billable/Internal Movement sebelum recovery, deduplikasi, dan reconciliation.
 - Adjacent Date / Midnight Recovery dari RAW DAT yang sudah dinormalisasi.
-- Matching utama STREAM melalui tanggal actual movement (ATD untuk departure, ATA untuk arrival), lalu original/recovered date sebagai fallback.
+- Matching utama STREAM melalui tanggal actual movement (ATD untuk departure, ATA untuk arrival) dengan window ±1 hari, lalu original/recovered date sebagai fallback.
 - Special remark DIVERT/RTB/RETURN/REROUTE/ALTERNATE dapat dicocokkan tanpa route dalam window tanggal ±1 hari dan diarahkan ke Perlu Review STREAM.
 - Recovered movement date validation dan AC-register mismatch routing ke Need Review.
 - Deduplikasi per flight instance agar pergerakan berbeda tidak saling menimpa.
 - Audit reason untuk setiap hasil dan candidate STREAM.
 - Kolom Actual Movement Date dari ATA untuk arrival atau ATD untuk departure, tanpa mengubah EOBD sebagai base key.
 - Filter Missing in Stream berdasarkan tanggal, flight number, aerodrome, TO FROM, dan movement.
-- Kolom VALIDASI: ADA DI STREAM, ADA DI DAT TIDAK ADA DI STREAM, atau PERLU REVIEW STREAM.
+- Kolom VALIDASI: ADA DI STREAM, PERLU REVIEW STREAM, PERLU REVIEW DAT, atau ADA DI DAT TIDAK ADA DI STREAM.
 - Dashboard metrik Validasi dan accuracy percentage.
 - Laporan Excel sembilan sheet, termasuk Validasi, Audit Detail, dan Excluded Non-Billable.
 
@@ -67,9 +67,9 @@ Record diprioritaskan berdasarkan tanggal/waktu actual movement dan kombinasi:
 - ADES / TO FROM
 - Movement Type (D/A/L/O)
 
-Date of Flight/EOBD tetap ditampilkan dan digunakan sebagai fallback bersama recovered date. Sheet Validasi hanya memuat DAT yang tidak memiliki kandidat STREAM pada seluruh jalur pencarian; kandidat dengan masalah status, tanggal, waktu, register, atau special remark diberi VALIDASI `PERLU REVIEW STREAM`.
+Date of Flight/EOBD tetap ditampilkan dan digunakan sebagai fallback bersama recovered date. Sheet Validasi hanya memuat DAT dengan movement time valid yang tidak memiliki kandidat STREAM pada seluruh jalur pencarian. Kandidat dengan masalah status, tanggal, waktu, register, atau special remark diberi VALIDASI `PERLU REVIEW STREAM`; DAT tanpa ATD departure atau ATA arrival diberi `PERLU REVIEW DAT`.
 
-Untuk STREAM ber-remark `DIVERT`, `DIVERSION`, `DVT`, `RTB`, `RETURN TO BASE`, `RETURN`, `REROUTE`, `ALTN`, atau `ALTERNATE`, AERODROME dan TO FROM boleh diabaikan. Flight Number, movement type, register (jika tersedia), serta ATD/ATA dalam tolerance tetap wajib sesuai. Audit menyimpan remark, keyword, flag special remark, dan flag route ignored.
+Untuk STREAM ber-remark `DIVERT`, `DIVERSION`, `DVT`, `RTB`, `RETURN TO BASE`, `RETURN`, `REROUTE`, `ALTN`, atau `ALTERNATE`, AERODROME dan TO FROM boleh diabaikan. Kolom checkbox `DIVERT` dan `RTB/RTA` juga dibaca. Flight Number, movement type, register (jika tersedia), serta ATD/ATA dalam tolerance tetap wajib sesuai. Audit menyimpan remark, keyword, flag special remark, dan flag route ignored.
 
 Untuk setiap base key, FINDER memilih satu DAT terbaik: movement time terisi, completeness score tertinggi, timestamp terbaru, lalu message number terbesar. Hanya record yang tidak terpilih masuk Duplicate DAT; record terbaik selalu dipakai dalam reconciliation.
 

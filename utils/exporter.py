@@ -23,13 +23,10 @@ MISSING_EXPORT_COLUMNS = DISPLAY_RESULT_COLUMNS + [
 ] + SPECIAL_REMARK_AUDIT_COLUMNS + RECOVERY_AUDIT_COLUMNS
 
 VALIDATION_EXPORT_COLUMNS = DISPLAY_RESULT_COLUMNS + [
-    "STATUS",
     "MATCH_REASON",
-    "STREAM STATUS FLIGHT",
-    "DAT MOVEMENT DATETIME",
-    "STREAM MOVEMENT DATETIME",
-    "TIME DIFFERENCE MINUTES",
-] + SPECIAL_REMARK_AUDIT_COLUMNS + RECOVERY_AUDIT_COLUMNS
+    "DAT_RECOVERY_USED",
+    "STREAM MATCH MODE",
+]
 
 
 def _select_columns(frame: pd.DataFrame, requested: list[str] | None) -> pd.DataFrame:
@@ -115,6 +112,11 @@ def build_excel_report(results: Mapping[str, object]) -> bytes:
             for column in (1, 2):
                 summary_sheet.cell(row_index, column).fill = PatternFill(
                     "solid", fgColor="FFF1E5"
+                )
+        elif row.METRIC == "Total Perlu Review DAT":
+            for column in (1, 2):
+                summary_sheet.cell(row_index, column).fill = PatternFill(
+                    "solid", fgColor="FFF7D6"
                 )
         elif row_index % 2:
             for column in (1, 2):

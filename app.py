@@ -31,7 +31,7 @@ st.set_page_config(
 # Clear reconciliation output created with an older result schema. Without this,
 # a long-lived Streamlit session can keep displaying a cached table that predates
 # newly added result columns even after the application has been redeployed.
-RESULT_SCHEMA_VERSION = "2026-07-01-special-remark-validation-v6"
+RESULT_SCHEMA_VERSION = "2026-07-02-final-validation-v7"
 if st.session_state.get("finder_result_schema_version") != RESULT_SCHEMA_VERSION:
     for stale_key in (
         "finder_results",
@@ -490,7 +490,7 @@ def render_summary_dashboard(results: dict[str, object]) -> None:
         metric_card("Accuracy Percentage", f"{summary['accuracy_percentage']:.1f}%", "#13a8bd", "Matched ÷ unique DAT")
 
     st.write("")
-    validation_cols = st.columns(3)
+    validation_cols = st.columns(4)
     with validation_cols[0]:
         metric_card(
             "Total Ada di STREAM",
@@ -512,6 +512,13 @@ def render_summary_dashboard(results: dict[str, object]) -> None:
             f"{summary['total_perlu_review_stream']:,}",
             "#f28b30",
             "Candidate found with discrepancy",
+        )
+    with validation_cols[3]:
+        metric_card(
+            "Total Perlu Review DAT",
+            f"{summary['total_perlu_review_dat']:,}",
+            "#d99a1b",
+            "DAT movement time incomplete",
         )
 
     st.write("")
@@ -682,7 +689,7 @@ def render_results_page(results: dict[str, object]) -> None:
     )
     with tabs[0]:
         st.error(
-            "VALIDASI — Hanya data DAT yang tidak memiliki kandidat STREAM setelah pencarian actual movement, original date, dan recovered date."
+            "VALIDASI — Hanya DAT dengan movement time valid yang tidak memiliki kandidat STREAM setelah seluruh pencarian normal dan special remark."
         )
         validated_missing = filtered_missing_table(
             results["validasi"], key_prefix="validasi"
@@ -898,7 +905,7 @@ def render_about_page() -> None:
         with st.container(border=True):
             st.markdown("#### 🎯 Matching logic")
             st.markdown(
-                "Record diprioritaskan berdasarkan **tanggal/waktu actual movement ATD/ATA + Flight Number + ADEP/Aerodrome + ADES/TO FROM + Movement Type**. Date of Flight dan recovered date digunakan sebagai fallback. Untuk special remark DIVERT/RTB/ALTERNATE, route boleh diabaikan dan hasil masuk Perlu Review STREAM."
+                "Record diprioritaskan berdasarkan **tanggal/waktu actual movement ATD/ATA + Flight Number + ADEP/Aerodrome + ADES/TO FROM + Movement Type** dengan window ±1 hari. DAT tanpa ATD/ATA masuk Perlu Review DAT. Untuk special remark DIVERT/RTB/ALTERNATE, route boleh diabaikan dan hasil masuk Perlu Review STREAM."
             )
     with about_right:
         with st.container(border=True):

@@ -52,10 +52,12 @@ RESULT_COLUMNS = [
 VALIDATION_FOUND = "ADA DI STREAM"
 VALIDATION_NOT_FOUND = "ADA DI DAT TIDAK ADA DI STREAM"
 VALIDATION_REVIEW = "PERLU REVIEW STREAM"
+VALIDATION_REVIEW_DAT = "PERLU REVIEW DAT"
 VALIDATION_VALUES = (
     VALIDATION_FOUND,
     VALIDATION_NOT_FOUND,
     VALIDATION_REVIEW,
+    VALIDATION_REVIEW_DAT,
 )
 DISPLAY_RESULT_COLUMNS = RESULT_COLUMNS + ["VALIDASI"]
 
@@ -84,6 +86,15 @@ SPECIAL_REMARK_SOURCE_COLUMNS = {
 SPECIAL_REMARK_TEXT_COLUMNS = {
     normalize_header(column)
     for column in ("REMARK", "REMARKS", "KETERANGAN", "NOTE", "NOTES")
+}
+SPECIAL_REMARK_FLAG_COLUMNS = {
+    normalize_header(column): keyword
+    for column, keyword in (
+        ("DIVERT", "DIVERT"),
+        ("RTB/RTA", "RTB"),
+        ("RTB", "RTB"),
+        ("RTA", "RTB"),
+    )
 }
 SPECIAL_REMARK_AUDIT_COLUMNS = [
     "STREAM REMARK",
@@ -232,10 +243,30 @@ def _special_remark_text_parts(
 def special_stream_remark_keyword(row: pd.Series) -> str:
     """Return the first configured special-operation keyword found in STREAM."""
     combined_text = " ".join(_special_remark_text_parts(row)).upper().strip()
-    return next(
+    text_keyword = next(
         (keyword for keyword in SPECIAL_REMARK_KEYWORDS if keyword in combined_text),
         "",
     )
+    if text_keyword:
+        return text_keyword
+    unchecked_values = {
+        "",
+        "-",
+        "NAN",
+        "NONE",
+        "FALSE",
+        "NO",
+        "0",
+        "UNCHECKED",
+    }
+    for column in row.index:
+        flag_keyword = SPECIAL_REMARK_FLAG_COLUMNS.get(normalize_header(column))
+        if not flag_keyword:
+            continue
+        flag_value = clean_text(row.get(column, "")).upper().strip()
+        if flag_value not in unchecked_values:
+            return flag_keyword
+    return ""
 
 
 def has_special_stream_remark(row: pd.Series) -> bool:
@@ -247,7 +278,9 @@ def _stream_remark_display(row: pd.Series) -> str:
     if remark_parts:
         return " / ".join(remark_parts)
     status_parts = _special_remark_text_parts(row, include_status=True)
-    return " / ".join(status_parts) if special_stream_remark_keyword(row) else ""
+    if status_parts and special_stream_remark_keyword(row):
+        return " / ".join(status_parts)
+    return special_stream_remark_keyword(row)
 
 
 def read_uploaded_table(data: bytes, filename: str) -> tuple[pd.DataFrame, str]:
@@ -892,9 +925,12 @@ def _match_key_for_date(row: pd.Series, match_date: object) -> str | None:
 
 def _stream_search_specs(dat_row: pd.Series) -> list[dict[str, str]]:
     """Return actual-movement lookup first, followed by date fallbacks."""
+    actual_movement_date = normalize_date(
+        dat_row.get("ACTUAL MOVEMENT DATE", "")
+    )
     requested = [
         (
-            dat_row.get("ACTUAL MOVEMENT DATE", ""),
+            actual_movement_date,
             "ACTUAL MOVEMENT DATE",
             "ACTUAL MOVEMENT DATE MATCH",
             "MOVEMENT DATE",
@@ -906,6 +942,20 @@ def _stream_search_specs(dat_row: pd.Series) -> list[dict[str, str]]:
             "DATE OF FLIGHT",
         )
     ]
+    if actual_movement_date:
+        actual_timestamp = pd.Timestamp(actual_movement_date)
+        for day_offset in (-1, 1):
+            offset_label = "-1 DAY" if day_offset < 0 else "+1 DAY"
+            requested.append(
+                (
+                    (actual_timestamp + pd.Timedelta(days=day_offset)).strftime(
+                        "%Y-%m-%d"
+                    ),
+                    f"ACTUAL MOVEMENT DATE {offset_label}",
+                    "ACTUAL MOVEMENT DATE WINDOW MATCH",
+                    "MOVEMENT DATE",
+                )
+            )
     if bool(dat_row.get("DAT_RECOVERY_USED", False)):
         requested.append(
             (
@@ -1045,6 +1095,7 @@ def _candidate_evaluation(
             "ACTUAL MOVEMENT DATE MATCH": 0,
             "RECOVERED DATE MATCH": 1,
             "ORIGINAL DATE MATCH": 2,
+            "ACTUAL MOVEMENT DATE WINDOW MATCH": 3,
             "SPECIAL REMARK MATCH": 3,
         }.get(match_mode, 3),
         priority_value,
@@ -1144,7 +1195,9 @@ def _result_from_dat(
         else ""
     )
     if validasi is None:
-        if selected_evaluation is None:
+        if _timestamp(dat_row.get("DAT_MOVEMENT_DATETIME")) is None:
+            validasi = VALIDATION_REVIEW_DAT
+        elif selected_evaluation is None:
             validasi = VALIDATION_NOT_FOUND
         elif status == "MATCHED":
             validasi = VALIDATION_FOUND
@@ -1386,6 +1439,17 @@ def reconcile_dat_vs_stream(
     candidate_stream_source_rows: set[int] = set()
 
     for _, dat_row in dat_unique.iterrows():
+        if _timestamp(dat_row.get("DAT_MOVEMENT_DATETIME")) is None:
+            result = _result_from_dat(
+                dat_row,
+                "MISSING IN STREAM",
+                "DAT MOVEMENT TIME EMPTY",
+                None,
+                validasi=VALIDATION_REVIEW_DAT,
+            )
+            missing_records.append(result)
+            audit_records.append(result.copy())
+            continue
         search_specs = _stream_search_specs(dat_row)
         evaluations_by_source_row: dict[int, dict[str, object]] = {}
         for search_spec in search_specs:
@@ -1443,9 +1507,9 @@ def reconcile_dat_vs_stream(
         evaluations = list(evaluations_by_source_row.values())
         if not evaluations:
             not_found_reason = (
-                "STREAM NOT FOUND AFTER ACTUAL MOVEMENT, ORIGINAL, AND RECOVERED DATE SEARCH"
+                "STREAM NOT FOUND AFTER ACTUAL MOVEMENT WINDOW, ORIGINAL, AND RECOVERED DATE SEARCH"
                 if bool(dat_row.get("DAT_RECOVERY_USED", False))
-                else "STREAM NOT FOUND AFTER ACTUAL MOVEMENT AND ORIGINAL DATE SEARCH"
+                else "STREAM NOT FOUND AFTER ACTUAL MOVEMENT WINDOW AND ORIGINAL DATE SEARCH"
             )
             result = _result_from_dat(
                 dat_row, "MISSING IN STREAM", not_found_reason, None
@@ -1601,6 +1665,10 @@ def reconcile_dat_vs_stream(
         missing["VALIDASI"].eq(VALIDATION_REVIEW).sum()
         + need_review["VALIDASI"].eq(VALIDATION_REVIEW).sum()
     )
+    validation_review_dat_total = int(
+        missing["VALIDASI"].eq(VALIDATION_REVIEW_DAT).sum()
+        + need_review["VALIDASI"].eq(VALIDATION_REVIEW_DAT).sum()
+    )
     accuracy = (matched_total / unique_dat_total * 100) if unique_dat_total else 0.0
     summary = {
         "total_dat_dep": len(dep),
@@ -1616,6 +1684,7 @@ def reconcile_dat_vs_stream(
         "total_ada_di_stream": validation_found_total,
         "total_validasi": len(validasi),
         "total_perlu_review_stream": validation_review_total,
+        "total_perlu_review_dat": validation_review_dat_total,
         "extra_in_stream": len(extra),
         "duplicate_dat": len(duplicate_dat),
         "excluded_dat_non_billable": len(dat_excluded),
@@ -1641,6 +1710,7 @@ def reconcile_dat_vs_stream(
                 "Total Perlu Review STREAM",
                 summary["total_perlu_review_stream"],
             ),
+            ("Total Perlu Review DAT", summary["total_perlu_review_dat"]),
             ("Extra in Stream", summary["extra_in_stream"]),
             ("Duplicate DAT", summary["duplicate_dat"]),
             ("Excluded DAT Non-Billable", summary["excluded_dat_non_billable"]),
